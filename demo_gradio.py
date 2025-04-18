@@ -19,6 +19,10 @@ import math
 import imageio
 import gc
 
+# --- [新增] 导入 Accelerate ---
+from accelerate import Accelerator
+from accelerate.utils import release_memory # 用于更彻底的内存释放
+
 from PIL import Image
 from diffusers import AutoencoderKLHunyuanVideo
 from transformers import LlamaModel, CLIPTextModel, LlamaTokenizerFast, CLIPTokenizer
@@ -27,7 +31,9 @@ from diffusers_helper.hunyuan import encode_prompt_conds, vae_decode, vae_encode
 from diffusers_helper.utils import save_bcthw_as_mp4, crop_or_pad_yield_mask, soft_append_bcthw, resize_and_center_crop, state_dict_weighted_merge, state_dict_offset_merge, generate_timestamp
 from diffusers_helper.models.hunyuan_video_packed import HunyuanVideoTransformer3DModelPacked
 from diffusers_helper.pipelines.k_diffusion_hunyuan import sample_hunyuan
-from diffusers_helper.memory import cpu, gpu, get_cuda_free_memory_gb, move_model_to_device_with_memory_preservation, offload_model_from_device_for_memory_preservation, fake_diffusers_current_device, DynamicSwapInstaller, unload_complete_models, load_model_as_complete
+# --- [修改] 移除手动内存管理相关的导入 ---
+# from diffusers_helper.memory import cpu, gpu, get_cuda_free_memory_gb, move_model_to_device_with_memory_preservation, offload_model_from_device_for_memory_preservation, fake_diffusers_current_device, DynamicSwapInstaller, unload_complete_models, load_model_as_complete
+from diffusers_helper.memory import cpu, gpu # 可能仍然需要 cpu, gpu
 from diffusers_helper.thread_utils import AsyncStream, async_run
 from diffusers_helper.gradio.progress_bar import make_progress_bar_css, make_progress_bar_html
 from transformers import SiglipImageProcessor, SiglipVisionModel
@@ -42,75 +48,107 @@ parser.add_argument("--port", type=int, required=False)
 parser.add_argument("--inbrowser", action='store_true')
 args = parser.parse_args()
 
-# for win desktop probably use --server 127.0.0.1 --inbrowser
-# For linux server probably use --server 127.0.0.1 or do not use any cmd flags
-
 print(args)
 
-free_mem_gb = get_cuda_free_memory_gb(gpu)
-high_vram = free_mem_gb > 60 # 根据可用显存判断是否为高显存模式
+# --- [修改] 不再需要手动检查 VRAM ---
+# free_mem_gb = get_cuda_free_memory_gb(gpu)
+# high_vram = free_mem_gb > 60
+# print(f'Free VRAM {free_mem_gb} GB')
+# print(f'High-VRAM Mode: {high_vram}')
 
-print(f'Free VRAM {free_mem_gb} GB')
-print(f'High-VRAM Mode: {high_vram}')
+# --- [修改] 使用 Accelerate 加载模型 ---
+# 注意: 使用 device_map="auto" 时，通常不需要再手动 .cpu() 或 .to(gpu)
+# Accelerate 会自动将模型层分布到可用设备
+# 为了进一步优化内存，可以考虑设置 low_cpu_mem_usage=True (需要 accelerate > 0.17.0)
+# max_memory 参数可以用来更精细地控制每个设备的内存限制 (可选)
+print("Loading models using Accelerate with device_map='auto'...")
+try:
+    text_encoder = LlamaModel.from_pretrained(
+        "hunyuanvideo-community/HunyuanVideo", subfolder='text_encoder', torch_dtype=torch.float16,
+        device_map="auto", low_cpu_mem_usage=True # 尝试开启低 CPU 内存使用
+    )
+    print("Loaded text_encoder.")
+    gc.collect(); torch.cuda.empty_cache() # 加载完一个清理一下
 
-# --- 模型和分词器加载 ---
-print("Loading models to CPU...")
-text_encoder = LlamaModel.from_pretrained("hunyuanvideo-community/HunyuanVideo", subfolder='text_encoder', torch_dtype=torch.float16).cpu()
-text_encoder_2 = CLIPTextModel.from_pretrained("hunyuanvideo-community/HunyuanVideo", subfolder='text_encoder_2', torch_dtype=torch.float16).cpu()
-tokenizer = LlamaTokenizerFast.from_pretrained("hunyuanvideo-community/HunyuanVideo", subfolder='tokenizer')
-tokenizer_2 = CLIPTokenizer.from_pretrained("hunyuanvideo-community/HunyuanVideo", subfolder='tokenizer_2')
-vae = AutoencoderKLHunyuanVideo.from_pretrained("hunyuanvideo-community/HunyuanVideo", subfolder='vae', torch_dtype=torch.float16).cpu()
+    text_encoder_2 = CLIPTextModel.from_pretrained(
+        "hunyuanvideo-community/HunyuanVideo", subfolder='text_encoder_2', torch_dtype=torch.float16,
+        device_map="auto", low_cpu_mem_usage=True
+    )
+    print("Loaded text_encoder_2.")
+    gc.collect(); torch.cuda.empty_cache()
 
-feature_extractor = SiglipImageProcessor.from_pretrained("lllyasviel/flux_redux_bfl", subfolder='feature_extractor')
-image_encoder = SiglipVisionModel.from_pretrained("lllyasviel/flux_redux_bfl", subfolder='image_encoder', torch_dtype=torch.float16).cpu()
+    vae = AutoencoderKLHunyuanVideo.from_pretrained(
+        "hunyuanvideo-community/HunyuanVideo", subfolder='vae', torch_dtype=torch.float16,
+        device_map="auto", low_cpu_mem_usage=True
+    )
+    print("Loaded vae.")
+    gc.collect(); torch.cuda.empty_cache()
 
-transformer = HunyuanVideoTransformer3DModelPacked.from_pretrained('lllyasviel/FramePackI2V_HY', torch_dtype=torch.float16).cpu()
-print("Models loaded to CPU.")
+    transformer = HunyuanVideoTransformer3DModelPacked.from_pretrained(
+        'lllyasviel/FramePackI2V_HY', torch_dtype=torch.float16,
+        device_map="auto", low_cpu_mem_usage=True
+    )
+    print("Loaded transformer.")
+    gc.collect(); torch.cuda.empty_cache()
 
-# --- 设置模型为评估模式和数据类型 ---
+    # Image Encoder (Siglip) 可能需要单独处理 device_map，因为它来自不同仓库
+    # 如果加载失败，可能需要去掉 device_map="auto" 手动处理
+    try:
+        image_encoder = SiglipVisionModel.from_pretrained(
+            "lllyasviel/flux_redux_bfl", subfolder='image_encoder', torch_dtype=torch.float16,
+            device_map="auto", low_cpu_mem_usage=True
+        )
+        print("Loaded image_encoder.")
+    except Exception as e_img_enc:
+        print(f"Warning: Failed to load image_encoder with device_map='auto': {e_img_enc}. Loading to CPU instead.")
+        image_encoder = SiglipVisionModel.from_pretrained(
+            "lllyasviel/flux_redux_bfl", subfolder='image_encoder', torch_dtype=torch.float16
+        ).cpu() # 如果自动映射失败，回退到 CPU
+
+    gc.collect(); torch.cuda.empty_cache()
+
+    # 加载 Tokenizer 和 Feature Extractor (这些通常不大，放 CPU 即可)
+    tokenizer = LlamaTokenizerFast.from_pretrained("hunyuanvideo-community/HunyuanVideo", subfolder='tokenizer')
+    tokenizer_2 = CLIPTokenizer.from_pretrained("hunyuanvideo-community/HunyuanVideo", subfolder='tokenizer_2')
+    feature_extractor = SiglipImageProcessor.from_pretrained("lllyasviel/flux_redux_bfl", subfolder='feature_extractor')
+
+    print("Models loaded (potentially distributed across devices).")
+
+except Exception as e_load:
+    print(f"FATAL ERROR DURING MODEL LOADING: {e_load}")
+    traceback.print_exc()
+    # 可能需要在这里退出程序或给出错误提示
+    exit()
+
+# --- 设置模型为评估模式 ---
+# 注意：当使用 device_map 时，模型可能分布在不同设备上，直接 .eval() 即可
 vae.eval()
 text_encoder.eval()
 text_encoder_2.eval()
 image_encoder.eval()
 transformer.eval()
 
-if not high_vram:
-    vae.enable_slicing()
-    vae.enable_tiling()
-    print("VAE slicing and tiling enabled for low VRAM.")
+# --- [修改] 移除 VAE Slicing/Tiling 和手动类型转换 ---
+# Accelerate 会处理设备放置，手动类型转换在加载时已指定
+# if not high_vram:
+#     vae.enable_slicing()
+#     vae.enable_tiling()
+# transformer.to(dtype=torch.float16) ... etc. (这些都不需要了)
 
-transformer.high_quality_fp32_output_for_inference = True
+transformer.high_quality_fp32_output_for_inference = True # 这个可能还需要
 print('transformer.high_quality_fp32_output_for_inference = True')
 
-# --- 确保模型使用 float16 ---
-transformer.to(dtype=torch.float16)
-vae.to(dtype=torch.float16)
-image_encoder.to(dtype=torch.float16)
-text_encoder.to(dtype=torch.float16)
-text_encoder_2.to(dtype=torch.float16)
-print("Models converted to float16.")
-
 # --- 禁用梯度计算 ---
-vae.requires_grad_(False)
-text_encoder.requires_grad_(False)
-text_encoder_2.requires_grad_(False)
-image_encoder.requires_grad_(False)
-transformer.requires_grad_(False)
+# vae.requires_grad_(False) # 应该在加载时处理或默认如此，但保留也无妨
+# text_encoder.requires_grad_(False)
+# text_encoder_2.requires_grad_(False)
+# image_encoder.requires_grad_(False)
+# transformer.requires_grad_(False)
+# 使用 torch.no_grad() 上下文通常更推荐
 
-# --- 根据显存情况处理模型位置 ---
-if not high_vram:
-    print("Installing DynamicSwap for low VRAM mode...")
-    DynamicSwapInstaller.install_model(transformer, device=gpu)
-    DynamicSwapInstaller.install_model(text_encoder, device=gpu)
-    print("DynamicSwap installed.")
-else:
-    print("Moving models to GPU for high VRAM mode...")
-    text_encoder.to(gpu)
-    text_encoder_2.to(gpu)
-    image_encoder.to(gpu)
-    vae.to(gpu)
-    transformer.to(gpu)
-    print("Models moved to GPU.")
+# --- [修改] 移除手动模型放置和 DynamicSwap ---
+# if not high_vram: ... else: ... (这整块都不需要了)
+# DynamicSwapInstaller.install_model(...) (移除)
 
 # --- 初始化异步流和输出目录 ---
 stream = AsyncStream()
@@ -119,8 +157,12 @@ os.makedirs(outputs_folder, exist_ok=True)
 
 
 # --- Worker 函数定义 ---
-@torch.no_grad()
+@torch.no_grad() # 使用上下文管理器禁用梯度
 def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache):
+    # --- [修改] 移除 gpu_memory_preservation 参数，因为内存管理由 Accelerate 接管 ---
+    # def worker(..., gpu_memory_preservation, use_teacache): -> def worker(..., use_teacache):
+    # 并且移除 Gradio 界面上的 gpu_memory_preservation 滑块
+
     total_latent_sections = (total_second_length * 30) / (latent_window_size * 4)
     total_latent_sections = int(max(round(total_latent_sections), 1))
 
@@ -134,42 +176,30 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
 
     stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'Starting ...'))))
 
+    # --- 获取当前 Accelerate 使用的主设备 (通常是第一个 GPU) ---
+    # 注意：Accelerate 可能将模型分布，但计算通常发生在主设备上
+    # 或者根据模型各部分的 device 属性来移动数据
+    # 更简单的方式是让 hunyuan.py 内部处理 .to(model.device)
+    # 这里假设主要的计算设备是 gpu (通常是 'cuda:0')
+    compute_device = gpu # 或者 torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
     try:
-        # --- 清理 GPU ---
-        if not high_vram:
-            print("Unloading models from GPU...")
-            unload_complete_models(
-                text_encoder, text_encoder_2, image_encoder, vae, transformer
-            )
+        # --- [修改] 移除手动的模型加载/卸载 ---
+        # if not high_vram: unload_complete_models(...) (移除)
 
         # --- 文本编码 ---
         stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'Text encoding ...'))))
-        if not high_vram:
-            # --- [保持] 只加载 text_encoder_2，并手动移动 text_encoder 的 embedding 层 ---
-            print("Low VRAM: Loading text_encoder_2 to GPU...")
-            load_model_as_complete(text_encoder_2, target_device=gpu)
-            print("Low VRAM: Moving text_encoder's embedding layer to GPU...")
-            try:
-                text_encoder.embed_tokens.to(gpu)
-                gc.collect()
-                print("Text encoder embedding moved to GPU.")
-            except Exception as e_embed:
-                 print(f"Warning: Failed to move text_encoder embedding to GPU: {e_embed}")
-            # --- [结束] ---
+        # --- [修改] 移除手动的模型加载/卸载和 embed_tokens 移动 ---
+        # if not high_vram: ... (移除)
 
+        # 调用编码函数 (hunyuan.py 中的代码会将 input_ids 移到 model.device)
+        # 确保 encode_prompt_conds 内部的 .to(model.device) 仍然有效
+        print("Starting text encoding...")
         llama_vec, clip_l_pooler = encode_prompt_conds(prompt, text_encoder, text_encoder_2, tokenizer, tokenizer_2)
+        print("Text encoding finished.")
 
-        # --- [保持] 编码后，将 Embedding 层移回 CPU 并卸载 text_encoder_2 ---
-        if not high_vram:
-            print("Low VRAM: Moving text_encoder's embedding layer back to CPU...")
-            try:
-                text_encoder.embed_tokens.to(cpu)
-                gc.collect()
-                print("Low VRAM: Unloading text_encoder_2 from GPU...")
-                unload_complete_models(text_encoder_2)
-            except Exception as e_unload:
-                print(f"Warning: Error during post-encoding cleanup: {e_unload}")
-        # --- [结束] ---
+        # --- [修改] 移除手动的模型加载/卸载 ---
+        # if not high_vram: ... (移除)
 
         # --- 处理输入图像 ---
         stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'Image processing ...'))))
@@ -178,52 +208,58 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
         input_image_np = resize_and_center_crop(input_image, target_width=width, target_height=height)
         Image.fromarray(input_image_np).save(os.path.join(outputs_folder, f'{job_id}.png'))
         input_image_pt = torch.from_numpy(input_image_np).float() / 127.5 - 1.0
-        input_image_pt = input_image_pt.permute(2, 0, 1)[None, :, None]
+        input_image_pt = input_image_pt.permute(2, 0, 1)[None, :, None] # B, C, T, H, W
+        # 确保 input_image_pt 在 VAE 需要的设备上
+        # vae.device 在 Accelerate 下可能是 'cpu' 或 'cuda:?'
+        input_image_pt = input_image_pt.to(vae.device) # 移动输入到 VAE 设备
+        print(f"Input image processed and moved to {vae.device}")
 
         # --- VAE 编码 ---
         stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'VAE encoding ...'))))
-        if not high_vram:
-            # --- [新增日志] ---
-            print("Low VRAM: Loading VAE to GPU...")
-            load_model_as_complete(vae, target_device=gpu)
-            print("Low VRAM: VAE loaded to GPU.")
-            # --- [结束新增日志] ---
-        # --- [新增日志] ---
+        # --- [修改] 移除手动的模型加载/卸载 ---
+        # if not high_vram: load_model_as_complete(vae, ...) (移除)
         print("Starting VAE encoding...")
-        start_latent = vae_encode(input_image_pt, vae)
+        # vae_encode 内部会将 image 移到 vae.device
+        start_latent = vae_encode(input_image_pt, vae) # vae 在 Accelerate 管理下可能在 CPU 或 GPU
         print(f"VAE encoding finished. Start latent shape: {start_latent.shape}, dtype: {start_latent.dtype}, device: {start_latent.device}")
-        # --- [结束新增日志] ---
+        # start_latent 需要移到后续计算设备 (比如 transformer 的设备)
+        start_latent = start_latent.to(compute_device) # 移动到主计算设备
+        print(f"Start latent moved to {compute_device}")
+
 
         # --- CLIP Vision 编码 ---
         stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'CLIP Vision encoding ...'))))
-        if not high_vram:
-            # --- [新增日志和 GC] ---
-            print("Low VRAM: Unloading VAE from GPU...")
-            unload_complete_models(vae) # 卸载 VAE
-            gc.collect() # <--- 在加载下一个模型前强制回收内存
-            print("Low VRAM: Loading Image Encoder to GPU...")
-            load_model_as_complete(image_encoder, target_device=gpu) # 加载 Image Encoder
-            print("Low VRAM: Image Encoder loaded to GPU.")
-            # --- [结束新增日志和 GC] ---
-        # --- [新增日志] ---
+        # --- [修改] 移除手动的模型加载/卸载 ---
+        # if not high_vram: unload_complete_models(vae); load_model_as_complete(image_encoder,...) (移除)
         print("Starting CLIP Vision encoding...")
+        # hf_clip_vision_encode 内部可能需要处理设备
+        # 确保 image_encoder 在正确的设备上处理 input_image_np (NumPy 在 CPU)
+        # 如果 image_encoder 被映射到 GPU，hf_clip_vision_encode 可能需要修改或手动处理
+        # 假设 hf_clip_vision_encode 能处理 NumPy 输入和可能在 GPU 的 image_encoder
         image_encoder_output = hf_clip_vision_encode(input_image_np, feature_extractor, image_encoder)
-        image_encoder_last_hidden_state = image_encoder_output.last_hidden_state
-        print("CLIP Vision encoding finished.")
-        # --- [结束新增日志] ---
+        image_encoder_last_hidden_state = image_encoder_output.last_hidden_state # 这个 hidden_state 在 image_encoder 的设备上
+        print(f"CLIP Vision encoding finished. Hidden state device: {image_encoder_last_hidden_state.device}")
+        # 将 hidden_state 移到主计算设备
+        image_encoder_last_hidden_state = image_encoder_last_hidden_state.to(compute_device)
+        print(f"Image encoder hidden state moved to {compute_device}")
+
 
         # --- Dtype 转换 ---
-        start_latent = start_latent.to(transformer.dtype)
-        llama_vec = llama_vec.to(transformer.dtype)
-        llama_vec_n = llama_vec_n.to(transformer.dtype)
-        clip_l_pooler = clip_l_pooler.to(transformer.dtype)
-        clip_l_pooler_n = clip_l_pooler_n.to(transformer.dtype)
-        image_encoder_last_hidden_state = image_encoder_last_hidden_state.to(transformer.dtype)
+        start_latent = start_latent.to(torch.float16) # 确保类型是 float16
+        # 其他 embedding/pooler 已经在 model.device 上，移动到 compute_device 并检查类型
+        llama_vec = llama_vec.to(compute_device, dtype=torch.float16)
+        llama_vec_n = llama_vec_n.to(compute_device, dtype=torch.float16)
+        clip_l_pooler = clip_l_pooler.to(compute_device, dtype=torch.float16)
+        clip_l_pooler_n = clip_l_pooler_n.to(compute_device, dtype=torch.float16)
+        image_encoder_last_hidden_state = image_encoder_last_hidden_state.to(compute_device, dtype=torch.float16)
+        print("Embeddings and poolers moved and converted to float16 on compute device.")
+
 
         # --- Sampling (采样) ---
         stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'Start sampling ...'))))
         rnd = torch.Generator("cpu").manual_seed(int(seed))
         num_frames = latent_window_size * 4 - 3
+        # history_latents 在 CPU 上，保持 float16
         history_latents = torch.zeros(size=(1, 16, 1 + 2 + 16, height // 8, width // 8), dtype=torch.float16).cpu()
         total_generated_latent_frames = 0
         latent_paddings = reversed(range(total_latent_sections))
@@ -251,28 +287,33 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
             indices = torch.arange(0, sum([1, latent_padding_size, latent_window_size, 1, 2, 16])).unsqueeze(0)
             clean_latent_indices_pre, blank_indices, latent_indices, clean_latent_indices_post, clean_latent_2x_indices, clean_latent_4x_indices = indices.split([1, latent_padding_size, latent_window_size, 1, 2, 16], dim=1)
             clean_latent_indices = torch.cat([clean_latent_indices_pre, clean_latent_indices_post], dim=1)
+            # 将 start_latent 转到 history (cpu, float16)
             clean_latents_pre = start_latent.to(device=history_latents.device, dtype=history_latents.dtype)
             clean_latents_post, clean_latents_2x, clean_latents_4x = history_latents[:, :, :1 + 2 + 16, :, :].split([1, 2, 16], dim=2)
             clean_latents = torch.cat([clean_latents_pre, clean_latents_post], dim=2)
 
-            # --- 移动 Transformer 模型 ---
-            if not high_vram:
-                unload_complete_models(image_encoder) # 卸载 Image Encoder
-                move_model_to_device_with_memory_preservation(transformer, target_device=gpu, preserved_memory_gb=gpu_memory_preservation)
+            # --- [修改] 移除手动的模型加载/卸载 ---
+            # if not high_vram: unload_complete_models(...); move_model_to_device_with_memory_preservation(...) (移除)
+            # Accelerate 会处理 transformer 的设备放置
 
-            # --- TeaCache 初始化 ---
-            if use_teacache:
-                transformer.initialize_teacache(enable_teacache=True, num_steps=steps)
-            else:
-                transformer.initialize_teacache(enable_teacache=False)
+            # --- TeaCache 初始化 (如果 transformer 支持) ---
+            # if use_teacache:
+            #     transformer.initialize_teacache(enable_teacache=True, num_steps=steps)
+            # else:
+            #     transformer.initialize_teacache(enable_teacache=False)
+            # 注意: TeaCache 可能与 Accelerate 的 device_map 不完全兼容，暂时注释掉或谨慎使用
 
             # --- 定义回调函数 ---
+            # (回调函数内部逻辑不变)
             def callback(d):
                 try:
                     preview = d['denoised']
-                    preview = vae_decode_fake(preview)
+                    # 使用 VAE 的 fake decode 进行预览，需要确保 VAE 在可用设备上
+                    # vae_decode_fake 需要 latents 在 vae.device 上
+                    preview_device = vae.device # 获取 VAE 当前设备
+                    preview = vae_decode_fake(preview.to(preview_device)) # 移动到 VAE 设备再解码
                     preview = (preview * 127.5 + 127.5).clamp(0, 255).byte()
-                    preview = preview.cpu().numpy()
+                    preview = preview.cpu().numpy() # 转回 CPU
                     t_idx = preview.shape[2] // 2
                     preview = preview[0, :, t_idx, :, :]
                     preview = preview.transpose(1, 2, 0)
@@ -288,12 +329,15 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
                     desc = f'Total generated frames: {int(approx_generated_video_frames)}, Video length: {approx_generated_seconds :.2f} seconds (FPS-30). The video is being extended now ...'
                     stream.output_queue.push(('progress', (preview, desc, make_progress_bar_html(percentage, hint))))
                 except Exception as e_callback:
-                    print(f"Error in callback: {e_callback}")
+                    print(f"Error in callback: {e_callback}") # 打印回调错误
                 return
 
             # --- 执行采样 ---
+            # 确保传递给 sample_hunyuan 的张量在正确的设备上
+            # sample_hunyuan 内部可能也需要处理 device_map
+            print("Starting sampling...")
             generated_latents = sample_hunyuan(
-                transformer=transformer,
+                transformer=transformer, # transformer 由 Accelerate 管理
                 sampler='unipc',
                 width=width,
                 height=height,
@@ -303,46 +347,53 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
                 guidance_rescale=rs,
                 num_inference_steps=steps,
                 generator=rnd,
+                # Embeddings 已经移到 compute_device
                 prompt_embeds=llama_vec,
-                prompt_embeds_mask=llama_attention_mask,
+                prompt_embeds_mask=llama_attention_mask.to(compute_device), # 确保 mask 也移动
                 prompt_poolers=clip_l_pooler,
                 negative_prompt_embeds=llama_vec_n,
-                negative_prompt_embeds_mask=llama_attention_mask_n,
+                negative_prompt_embeds_mask=llama_attention_mask_n.to(compute_device), # 确保 mask 也移动
                 negative_prompt_poolers=clip_l_pooler_n,
-                device=gpu,
+                device=compute_device, # 指定主计算设备
                 dtype=torch.float16,
                 image_embeddings=image_encoder_last_hidden_state,
                 latent_indices=latent_indices,
-                clean_latents=clean_latents.to(device=gpu, dtype=torch.float16),
+                # clean_latents 在 CPU 上，需要移到 compute_device
+                clean_latents=clean_latents.to(device=compute_device, dtype=torch.float16),
                 clean_latent_indices=clean_latent_indices,
-                clean_latents_2x=clean_latents_2x.to(device=gpu, dtype=torch.float16),
+                clean_latents_2x=clean_latents_2x.to(device=compute_device, dtype=torch.float16),
                 clean_latent_2x_indices=clean_latent_2x_indices,
-                clean_latents_4x=clean_latents_4x.to(device=gpu, dtype=torch.float16),
+                clean_latents_4x=clean_latents_4x.to(device=compute_device, dtype=torch.float16),
                 clean_latent_4x_indices=clean_latent_4x_indices,
                 callback=callback,
             )
+            print("Sampling finished for this section.")
+            # generated_latents 在 compute_device 上
 
             # --- 处理采样结果 ---
             if is_last_section:
+                # 将 start_latent (在 compute_device) 与 generated_latents 拼接
                 generated_latents = torch.cat([start_latent.to(device=generated_latents.device, dtype=generated_latents.dtype), generated_latents], dim=2)
 
             added_latent_frames_count = int(generated_latents.shape[2])
             total_generated_latent_frames += added_latent_frames_count
 
             # --- 更新 history_latents ---
+            # 将新生成的 latent (在 compute_device, float16) 移到 history_latents (在 CPU, float16) 并拼接
             history_latents = torch.cat([generated_latents.to(device=history_latents.device, dtype=history_latents.dtype), history_latents], dim=2)
 
             # --- VAE 解码和流式写入 ---
             if added_latent_frames_count > 0:
-                if not high_vram:
-                    offload_model_from_device_for_memory_preservation(transformer, target_device=gpu, preserved_memory_gb=8)
-                    load_model_as_complete(vae, target_device=gpu)
-
+                # --- [修改] 移除手动的模型加载/卸载 ---
+                # if not high_vram: offload_model_from_device_for_memory_preservation(...); load_model_as_complete(...) (移除)
+                print("Starting VAE decoding for writing...")
                 # --- 只解码本次循环新生成的 latent 部分 ---
-                latents_to_decode_this_iter = history_latents[:, :, :added_latent_frames_count, :, :].cpu()
+                latents_to_decode_this_iter = history_latents[:, :, :added_latent_frames_count, :, :] # 从 history 切片 (在 CPU)
 
                 # --- 确保传递给 vae_decode 的 latent 在 VAE 设备上且类型正确 ---
-                current_pixels_segment = vae_decode(latents_to_decode_this_iter.to(device=vae.device, dtype=vae.dtype), vae).float().cpu()
+                # VAE 可能在 CPU 或 GPU
+                current_pixels_segment = vae_decode(latents_to_decode_this_iter.to(device=vae.device, dtype=vae.dtype), vae).float().cpu() # 解码到 float32 CPU
+                print("VAE decoding for writing finished.")
 
                 # --- 转换为 NumPy uint8 格式 [T, H, W, C] for imageio ---
                 pixels_np = current_pixels_segment.squeeze(0)
@@ -370,8 +421,8 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
                 print("Memory released after decoding and writing.")
                 # --- 结束关键步骤 ---
 
-                if not high_vram:
-                    unload_complete_models(vae)
+                # --- [修改] 移除手动的模型加载/卸载 ---
+                # if not high_vram: unload_complete_models(vae) (移除)
 
             # --- 更新 Gradio 界面 ---
             print(f'Decoded and wrote segment. Total latent frames generated: {total_generated_latent_frames}')
@@ -396,66 +447,67 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
         if video_writer is not None:
             try: video_writer.close(); print("Video writer closed after interruption.")
             except Exception as e: print(f"Error closing video writer after interruption: {e}")
-            # video_writer = None
 
     except Exception: # 处理其他异常
         traceback.print_exc()
         if video_writer is not None:
             try: video_writer.close(); print("Video writer closed after exception.")
             except Exception as e: print(f"Error closing video writer after exception: {e}")
-            # video_writer = None
 
     finally: # 最终清理
         print("Entering finally block...")
-        # --- 卸载模型 ---
-        if not high_vram:
-            print("Unloading models in finally block...")
-            unload_complete_models(
-                text_encoder, text_encoder_2, image_encoder, vae, transformer
-            )
+        # --- [修改] 移除手动的模型加载/卸载 ---
+        # if not high_vram: unload_complete_models(...) (移除)
+        # 考虑是否需要释放 Accelerate 管理的模型？通常退出时会自动清理
+        # 使用 release_memory 尝试更彻底清理 (可选)
+        try:
+            release_memory(text_encoder, text_encoder_2, vae, image_encoder, transformer)
+            print("Accelerate release_memory called.")
+            gc.collect()
+            torch.cuda.empty_cache()
+        except Exception as e_release:
+            print(f"Error during release_memory: {e_release}")
+
         # --- 发送结束信号 ---
         print("Pushing end signal to stream.")
         stream.output_queue.push(('end', None))
         print("Worker function finished.")
 
+
 # --- Gradio 界面处理函数 ---
 def process(input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache):
+    # --- [修改] 移除 gpu_memory_preservation 参数 ---
+    # def process(..., gpu_memory_preservation, use_teacache): -> def process(..., use_teacache):
+    # 确保 Gradio 输入列表也移除它
     global stream
     assert input_image is not None, 'No input image!'
     print("Starting generation process...")
 
-    # 清空上一次的输出并禁用开始按钮，启用结束按钮
     yield None, None, '', '', gr.update(interactive=False), gr.update(interactive=True)
+    stream = AsyncStream()
 
-    stream = AsyncStream() # 创建新的异步流
-
-    # 异步运行 worker 函数
-    async_run(worker, input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache)
+    # --- [修改] 移除 gpu_memory_preservation 参数 ---
+    # async_run(worker, ..., gpu_memory_preservation, use_teacache) -> async_run(worker, ..., use_teacache)
+    async_run(worker, input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, use_teacache) # 移除 gpu_memory_preservation
 
     output_filename = None
-
-    # 循环处理 worker 函数通过 stream 发送的数据
     while True:
         flag, data = stream.output_queue.next()
-
-        if flag == 'file': # 更新视频文件路径
+        if flag == 'file':
             output_filename = data
             yield output_filename, gr.update(), gr.update(), gr.update(), gr.update(interactive=False), gr.update(interactive=True)
-
-        elif flag == 'progress': # 更新进度条和预览
+        elif flag == 'progress':
             preview, desc, html = data
             yield gr.update(value=output_filename), gr.update(visible=True, value=preview), desc, html, gr.update(interactive=False), gr.update(interactive=True)
-
-        elif flag == 'end': # 结束处理
+        elif flag == 'end':
             print("Generation process ended.")
             yield output_filename, gr.update(visible=False), gr.update(value=''), '', gr.update(interactive=True), gr.update(interactive=False)
-            break # 退出循环
+            break
 
 # --- 结束处理函数 ---
 def end_process():
     print("End generation requested by user.")
     stream.input_queue.push('end')
-
 
 # --- Gradio 界面定义 ---
 quick_prompts = [
@@ -464,8 +516,8 @@ quick_prompts = [
 ]
 quick_prompts = [[x] for x in quick_prompts]
 
-css = make_progress_bar_css() # 获取进度条 CSS
-block = gr.Blocks(css=css).queue() # 创建 Gradio Blocks 界面，启用队列
+css = make_progress_bar_css()
+block = gr.Blocks(css=css).queue()
 with block:
     gr.Markdown('# FramePack')
     with gr.Row():
@@ -479,29 +531,30 @@ with block:
                 start_button = gr.Button(value="Start Generation")
                 end_button = gr.Button(value="End Generation", interactive=False)
 
-            with gr.Group(): # 将高级选项分组
+            with gr.Group():
                 use_teacache = gr.Checkbox(label='Use TeaCache', value=True, info='Faster speed, but often makes hands and fingers slightly worse.')
-                n_prompt = gr.Textbox(label="Negative Prompt", value="", visible=False)  # 负向提示词 (当前版本未使用)
-                seed = gr.Number(label="Seed", value=31337, precision=0) # 随机种子
-                total_second_length = gr.Slider(label="Total Video Length (Seconds)", minimum=1, maximum=120, value=5, step=0.1) # 视频总时长
-                latent_window_size = gr.Slider(label="Latent Window Size", minimum=1, maximum=33, value=9, step=1, visible=False)  # 潜在空间窗口大小 (不建议修改)
-                steps = gr.Slider(label="Steps", minimum=1, maximum=100, value=25, step=1, info='Changing this value is not recommended.') # 采样步数
-                cfg = gr.Slider(label="CFG Scale", minimum=1.0, maximum=32.0, value=1.0, step=0.01, visible=False)  # CFG Scale (当前版本未使用)
-                gs = gr.Slider(label="Distilled CFG Scale", minimum=1.0, maximum=32.0, value=10.0, step=0.01, info='Changing this value is not recommended.') # 蒸馏 CFG Scale
-                rs = gr.Slider(label="CFG Re-Scale", minimum=0.0, maximum=1.0, value=0.0, step=0.01, visible=False)  # CFG Re-Scale (当前版本未使用)
-                gpu_memory_preservation = gr.Slider(label="GPU Inference Preserved Memory (GB) (larger means slower)", minimum=6, maximum=128, value=6, step=0.1, info="Set this number to a larger value if you encounter OOM. Larger value causes slower speed.") # GPU 推理保留内存
+                n_prompt = gr.Textbox(label="Negative Prompt", value="", visible=False)
+                seed = gr.Number(label="Seed", value=31337, precision=0)
+                total_second_length = gr.Slider(label="Total Video Length (Seconds)", minimum=1, maximum=120, value=5, step=0.1)
+                latent_window_size = gr.Slider(label="Latent Window Size", minimum=1, maximum=33, value=9, step=1, visible=False)
+                steps = gr.Slider(label="Steps", minimum=1, maximum=100, value=25, step=1, info='Changing this value is not recommended.')
+                cfg = gr.Slider(label="CFG Scale", minimum=1.0, maximum=32.0, value=1.0, step=0.01, visible=False)
+                gs = gr.Slider(label="Distilled CFG Scale", minimum=1.0, maximum=32.0, value=10.0, step=0.01, info='Changing this value is not recommended.')
+                rs = gr.Slider(label="CFG Re-Scale", minimum=0.0, maximum=1.0, value=0.0, step=0.01, visible=False)
+                # --- [修改] 移除 gpu_memory_preservation 滑块 ---
+                # gpu_memory_preservation = gr.Slider(...) (移除)
 
-        with gr.Column(): # 输出列
-            preview_image = gr.Image(label="Sampling Preview (Middle Frame)", height=200, visible=False) # 预览图像
-            result_video = gr.Video(label="Generated Video", autoplay=True, show_share_button=False, height=512, loop=True) # 结果视频
+        with gr.Column():
+            preview_image = gr.Image(label="Sampling Preview (Middle Frame)", height=200, visible=False)
+            result_video = gr.Video(label="Generated Video", autoplay=True, show_share_button=False, height=512, loop=True)
             gr.Markdown('Note that the ending actions will be generated before the starting actions due to the inverted sampling. If the starting action is not in the video, you just need to wait, and it will be generated later.')
-            progress_desc = gr.Markdown('', elem_classes='no-generating-animation') # 进度描述
-            progress_bar = gr.HTML('', elem_classes='no-generating-animation') # 进度条 HTML
+            progress_desc = gr.Markdown('', elem_classes='no-generating-animation')
+            progress_bar = gr.HTML('', elem_classes='no-generating-animation')
 
-    # 定义按钮点击事件
-    ips = [input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache]
+    # --- [修改] 更新 Gradio 输入列表，移除 gpu_memory_preservation ---
+    ips = [input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, use_teacache] # 移除 gpu_memory_preservation
     start_button.click(fn=process, inputs=ips, outputs=[result_video, preview_image, progress_desc, progress_bar, start_button, end_button])
-    end_button.click(fn=end_process) # 结束按钮调用 end_process
+    end_button.click(fn=end_process)
 
 # --- 启动 Gradio 应用 ---
 block.launch(
