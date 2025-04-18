@@ -257,7 +257,7 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
                 negative_prompt_embeds_mask=llama_attention_mask_n,
                 negative_prompt_poolers=clip_l_pooler_n,
                 device=gpu,
-                dtype=torch.bfloat16,
+                dtype=torch.float16,
                 image_embeddings=image_encoder_last_hidden_state,
                 latent_indices=latent_indices,
                 clean_latents=clean_latents,
