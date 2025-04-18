@@ -22,6 +22,7 @@ import gc
 from PIL import Image
 from diffusers import AutoencoderKLHunyuanVideo
 from transformers import LlamaModel, CLIPTextModel, LlamaTokenizerFast, CLIPTokenizer
+# 确保导入了所有需要的辅助函数
 from diffusers_helper.hunyuan import encode_prompt_conds, vae_decode, vae_encode, vae_decode_fake
 from diffusers_helper.utils import save_bcthw_as_mp4, crop_or_pad_yield_mask, soft_append_bcthw, resize_and_center_crop, state_dict_weighted_merge, state_dict_offset_merge, generate_timestamp
 from diffusers_helper.models.hunyuan_video_packed import HunyuanVideoTransformer3DModelPacked
@@ -101,7 +102,8 @@ if not high_vram:
     print("Installing DynamicSwap for low VRAM mode...")
     # DynamicSwapInstaller 类似于 huggingface 的 enable_sequential_offload，但更快
     DynamicSwapInstaller.install_model(transformer, device=gpu)
-    DynamicSwapInstaller.install_model(text_encoder, device=gpu) # 只安装一个 text_encoder 可能足够？根据需要调整
+    DynamicSwapInstaller.install_model(text_encoder, device=gpu) # 安装在 Llama 上
+    # 注意：DynamicSwapInstaller 不会安装在 text_encoder_2, vae, image_encoder 上
     print("DynamicSwap installed.")
 else:
     print("Moving models to GPU for high VRAM mode...")
@@ -145,19 +147,22 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
         # --- 文本编码 ---
         stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'Text encoding ...'))))
         if not high_vram:
-            # DynamicSwap 已安装在 text_encoder 上，这里可能不需要 fake_diffusers_current_device
-            # fake_diffusers_current_device(text_encoder, gpu)
-            load_model_as_complete(text_encoder_2, target_device=gpu) # 加载 text_encoder_2
+            # --- [修改] 显式加载两个文本编码器到 GPU ---
+            print("Low VRAM: Loading text encoders to GPU for encoding...")
+            load_model_as_complete(text_encoder, target_device=gpu)   # <--- 显式加载 Llama
+            load_model_as_complete(text_encoder_2, target_device=gpu) # <--- 显式加载 CLIP
+            print("Text encoders loaded to GPU.")
+            # --- [结束 修改] ---
 
+        # 调用编码函数 (hunyuan.py 中的代码不用改，它内部会将 input_ids 移到 model.device)
         llama_vec, clip_l_pooler = encode_prompt_conds(prompt, text_encoder, text_encoder_2, tokenizer, tokenizer_2)
 
-        if cfg == 1: # 如果 CFG 为 1，使用零向量作为负向提示
-            llama_vec_n, clip_l_pooler_n = torch.zeros_like(llama_vec), torch.zeros_like(clip_l_pooler)
-        else:
-            llama_vec_n, clip_l_pooler_n = encode_prompt_conds(n_prompt, text_encoder, text_encoder_2, tokenizer, tokenizer_2)
-
-        llama_vec, llama_attention_mask = crop_or_pad_yield_mask(llama_vec, length=512)
-        llama_vec_n, llama_attention_mask_n = crop_or_pad_yield_mask(llama_vec_n, length=512)
+        # --- [可选但推荐] 编码后立即卸载文本编码器以节省 VRAM ---
+        if not high_vram:
+            print("Low VRAM: Unloading text encoders from GPU after encoding...")
+            unload_complete_models(text_encoder) # <--- 卸载 Llama
+            unload_complete_models(text_encoder_2) # <--- 卸载 CLIP
+        # --- [结束 可选] ---
 
         # --- 处理输入图像 ---
         stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'Image processing ...'))))
@@ -171,17 +176,19 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
         # --- VAE 编码 ---
         stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'VAE encoding ...'))))
         if not high_vram:
-            load_model_as_complete(vae, target_device=gpu)
+            load_model_as_complete(vae, target_device=gpu) # 需要时加载 VAE
         start_latent = vae_encode(input_image_pt, vae) # 将输入图像编码为 latent
 
         # --- CLIP Vision 编码 ---
         stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'CLIP Vision encoding ...'))))
         if not high_vram:
-            load_model_as_complete(image_encoder, target_device=gpu)
+            unload_complete_models(vae) # 卸载 VAE，为 Image Encoder 腾空间
+            load_model_as_complete(image_encoder, target_device=gpu) # 需要时加载 Image Encoder
         image_encoder_output = hf_clip_vision_encode(input_image_np, feature_extractor, image_encoder)
         image_encoder_last_hidden_state = image_encoder_output.last_hidden_state # 获取图像 embedding
 
         # --- Dtype 转换 (确保所有 embedding 和 pooler 与 transformer 类型一致) ---
+        start_latent = start_latent.to(transformer.dtype) # 确保 start_latent 类型也匹配
         llama_vec = llama_vec.to(transformer.dtype)
         llama_vec_n = llama_vec_n.to(transformer.dtype)
         clip_l_pooler = clip_l_pooler.to(transformer.dtype)
@@ -220,13 +227,13 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
             clean_latent_indices_pre, blank_indices, latent_indices, clean_latent_indices_post, clean_latent_2x_indices, clean_latent_4x_indices = indices.split([1, latent_padding_size, latent_window_size, 1, 2, 16], dim=1)
             clean_latent_indices = torch.cat([clean_latent_indices_pre, clean_latent_indices_post], dim=1)
             # --- [修正] 使用关键字参数调用 .to() ---
-            clean_latents_pre = start_latent.to(device=history_latents.device, dtype=history_latents.dtype)
+            clean_latents_pre = start_latent.to(device=history_latents.device, dtype=history_latents.dtype) # 将 start_latent 转到 history (cpu, float16)
             clean_latents_post, clean_latents_2x, clean_latents_4x = history_latents[:, :, :1 + 2 + 16, :, :].split([1, 2, 16], dim=2)
             clean_latents = torch.cat([clean_latents_pre, clean_latents_post], dim=2)
 
             # --- 移动 Transformer 模型 ---
             if not high_vram:
-                unload_complete_models() # 卸载其他模型
+                unload_complete_models(image_encoder) # 卸载 Image Encoder，为 Transformer 腾空间
                 move_model_to_device_with_memory_preservation(transformer, target_device=gpu, preserved_memory_gb=gpu_memory_preservation)
 
             # --- TeaCache 初始化 ---
@@ -238,26 +245,27 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
             # --- 定义回调函数 ---
             def callback(d):
                 try:
-                    preview = d['denoised']
-                    preview = vae_decode_fake(preview)
-                    preview = (preview * 127.5 + 127.5).clamp(0, 255).byte()
-                    preview = preview.cpu().numpy()
-                    t_idx = preview.shape[2] // 2
-                    preview = preview[0, :, t_idx, :, :]
-                    preview = preview.transpose(1, 2, 0)
+                    preview = d['denoised'] # 获取去噪后的 latent
+                    preview = vae_decode_fake(preview) # 使用快速 fake 解码获取预览
+                    preview = (preview * 127.5 + 127.5).clamp(0, 255).byte() # 转换到 0-255 uint8
+                    preview = preview.cpu().numpy() # 转 NumPy
+                    t_idx = preview.shape[2] // 2 # 取时间中间帧索引
+                    preview = preview[0, :, t_idx, :, :] # 选择 Batch 0, 所有通道, 中间帧, 所有高宽 [C, H, W]
+                    preview = preview.transpose(1, 2, 0) # 转换 HWC 格式给 Gradio Image
 
-                    if stream.input_queue.top() == 'end':
+                    if stream.input_queue.top() == 'end': # 检查用户是否停止
                         raise KeyboardInterrupt('User ends the task during callback.')
 
-                    current_step = d['i'] + 1
-                    percentage = int(100.0 * current_step / steps)
-                    hint = f'Sampling {current_step}/{steps}'
-                    approx_generated_video_frames = max(0, total_generated_latent_frames * 4 - 3)
-                    approx_generated_seconds = approx_generated_video_frames / 30.0
+                    current_step = d['i'] + 1 # 当前步数
+                    percentage = int(100.0 * current_step / steps) # 计算百分比
+                    hint = f'Sampling {current_step}/{steps}' # 进度提示
+                    # 计算大致的已生成视频长度 (latent 帧数 * 4 - 3) / 30 fps
+                    approx_generated_video_frames = max(0, total_generated_latent_frames * 4 - 3) # 估算已生成的像素帧数
+                    approx_generated_seconds = approx_generated_video_frames / 30.0 # 估算已生成的秒数
                     desc = f'Total generated frames: {int(approx_generated_video_frames)}, Video length: {approx_generated_seconds :.2f} seconds (FPS-30). The video is being extended now ...'
-                    stream.output_queue.push(('progress', (preview, desc, make_progress_bar_html(percentage, hint))))
+                    stream.output_queue.push(('progress', (preview, desc, make_progress_bar_html(percentage, hint)))) # 推送进度
                 except Exception as e_callback:
-                    print(f"Error in callback: {e_callback}")
+                    print(f"Error in callback: {e_callback}") # 打印回调错误
                 return
 
             # --- 执行采样 ---
@@ -278,64 +286,73 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
                 negative_prompt_embeds=llama_vec_n,
                 negative_prompt_embeds_mask=llama_attention_mask_n,
                 negative_prompt_poolers=clip_l_pooler_n,
-                device=gpu,
-                dtype=torch.float16, # 确认是 float16
+                device=gpu, # 在 GPU 上运行采样
+                dtype=torch.float16, # 使用 float16
                 image_embeddings=image_encoder_last_hidden_state,
                 latent_indices=latent_indices,
-                clean_latents=clean_latents,
+                clean_latents=clean_latents.to(device=gpu, dtype=torch.float16), # clean_latents 需要在 GPU 上且类型匹配
                 clean_latent_indices=clean_latent_indices,
-                clean_latents_2x=clean_latents_2x,
+                clean_latents_2x=clean_latents_2x.to(device=gpu, dtype=torch.float16), # 同上
                 clean_latent_2x_indices=clean_latent_2x_indices,
-                clean_latents_4x=clean_latents_4x,
+                clean_latents_4x=clean_latents_4x.to(device=gpu, dtype=torch.float16), # 同上
                 clean_latent_4x_indices=clean_latent_4x_indices,
                 callback=callback,
             )
 
             # --- 处理采样结果 ---
-            if is_last_section:
+            if is_last_section: # 如果是最后一段，将起始 latent 拼接到开头
                 # --- [修正] 使用关键字参数调用 .to() ---
                 generated_latents = torch.cat([start_latent.to(device=generated_latents.device, dtype=generated_latents.dtype), generated_latents], dim=2)
 
-            added_latent_frames_count = int(generated_latents.shape[2])
-            total_generated_latent_frames += added_latent_frames_count
+            added_latent_frames_count = int(generated_latents.shape[2]) # 获取本次生成的 latent 帧数
+            total_generated_latent_frames += added_latent_frames_count # 更新总帧数
 
             # --- 更新 history_latents ---
             # --- [修正] 使用关键字参数调用 .to() ---
+            # 将新生成的 latent (在 GPU, float16) 移到 history_latents (在 CPU, float16) 并拼接
             history_latents = torch.cat([generated_latents.to(device=history_latents.device, dtype=history_latents.dtype), history_latents], dim=2)
 
             # --- VAE 解码和流式写入 ---
             if added_latent_frames_count > 0:
                 if not high_vram:
-                    offload_model_from_device_for_memory_preservation(transformer, target_device=gpu, preserved_memory_gb=8)
-                    load_model_as_complete(vae, target_device=gpu)
+                    offload_model_from_device_for_memory_preservation(transformer, target_device=gpu, preserved_memory_gb=8) # 卸载 Transformer
+                    load_model_as_complete(vae, target_device=gpu) # 加载 VAE
 
                 # --- 只解码本次循环新生成的 latent 部分 ---
-                latents_to_decode_this_iter = generated_latents.cpu() # 将新生成的 latent 移到 CPU
+                # 使用刚生成的 generated_latents，它已经在正确的设备和类型上 (需要确认！)
+                # 或者从 history_latents 切片，然后移到 VAE 设备
+                # 采用切片方式更安全，因为 generated_latents 可能已被修改
+                latents_to_decode_this_iter = history_latents[:, :, :added_latent_frames_count, :, :].cpu() # 从 history 切片并移到 CPU
 
                 # --- [修正] 使用关键字参数调用 .to() ---
                 # 确保传递给 vae_decode 的 latent 在 VAE 设备上且类型正确
                 current_pixels_segment = vae_decode(latents_to_decode_this_iter.to(device=vae.device, dtype=vae.dtype), vae).float().cpu() # 解码到 float32 CPU
 
                 # --- 转换为 NumPy uint8 格式 [T, H, W, C] for imageio ---
-                pixels_np = current_pixels_segment.squeeze(0)
-                pixels_np = pixels_np.permute(1, 2, 3, 0)
-                pixels_np = (pixels_np * 127.5 + 127.5).clamp(0, 255).byte()
-                pixels_np = pixels_np.numpy()
+                pixels_np = current_pixels_segment.squeeze(0) # 移除 Batch 维度 [C, T, H, W]
+                pixels_np = pixels_np.permute(1, 2, 3, 0)     # [T, H, W, C]
+                pixels_np = (pixels_np * 127.5 + 127.5).clamp(0, 255).byte() # [0, 255] uint8
+                pixels_np = pixels_np.numpy() # 转 NumPy
 
                 # --- 初始化视频写入器 (如果需要) ---
                 if video_writer is None:
                     fps_to_save = 30
-                    video_writer = imageio.get_writer(output_filename, fps=fps_to_save, codec='libx264', quality=8)
+                    # 设置 output_buffersize 增加写入缓冲，可能提高效率
+                    video_writer = imageio.get_writer(output_filename, fps=fps_to_save, codec='libx264', quality=8, output_params=['-preset', 'fast', '-tune', 'fastdecode'], macro_block_size=16, ffmpeg_log_level='warning') # 更详细的 ffmpeg 参数
+                    print(f"Video writer initialized for {output_filename}")
 
                 # --- 将当前段的帧写入视频文件 ---
+                print(f"Appending {pixels_np.shape[0]} frames to video...")
                 for i in range(pixels_np.shape[0]):
                     video_writer.append_data(pixels_np[i])
+                print(f"Frames appended.")
 
                 # --- 关键：释放内存 ---
                 del current_pixels_segment
                 del pixels_np
                 del latents_to_decode_this_iter
-                gc.collect()
+                gc.collect() # 手动触发垃圾回收
+                print("Memory released after decoding and writing.")
                 # --- 结束关键步骤 ---
 
                 if not high_vram:
@@ -352,6 +369,7 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
         # --- 循环正常结束后，关闭写入器 ---
         if video_writer is not None:
             try:
+                print("Closing video writer after loop completion...")
                 video_writer.close()
                 print("Video writer closed successfully after loop completion.")
                 video_writer = None # 标记为已关闭
@@ -407,17 +425,19 @@ def process(input_image, prompt, n_prompt, seed, total_second_length, latent_win
 
         if flag == 'file': # 更新视频文件路径
             output_filename = data
+            # 返回更新后的视频路径，其他 UI 组件保持不变或按需更新
             yield output_filename, gr.update(), gr.update(), gr.update(), gr.update(interactive=False), gr.update(interactive=True)
 
-        if flag == 'progress': # 更新进度条和预览
+        elif flag == 'progress': # 更新进度条和预览
             preview, desc, html = data
+            # 返回当前视频路径，更新预览图、描述和进度条
             yield gr.update(value=output_filename), gr.update(visible=True, value=preview), desc, html, gr.update(interactive=False), gr.update(interactive=True)
 
-        if flag == 'end': # 结束处理
+        elif flag == 'end': # 结束处理
             print("Generation process ended.")
             # 最终更新：显示最终视频，隐藏预览，清空进度，启用开始按钮，禁用结束按钮
             yield output_filename, gr.update(visible=False), gr.update(value=''), '', gr.update(interactive=True), gr.update(interactive=False)
-            break
+            break # 退出循环
 
 # --- 结束处理函数 ---
 def end_process():
@@ -460,7 +480,7 @@ with block:
                 gpu_memory_preservation = gr.Slider(label="GPU Inference Preserved Memory (GB) (larger means slower)", minimum=6, maximum=128, value=6, step=0.1, info="Set this number to a larger value if you encounter OOM. Larger value causes slower speed.") # GPU 推理保留内存
 
         with gr.Column(): # 输出列
-            preview_image = gr.Image(label="Next Latents Preview", height=200, visible=False) # 预览图像
+            preview_image = gr.Image(label="Sampling Preview (Middle Frame)", height=200, visible=False) # 预览图像
             result_video = gr.Video(label="Generated Video", autoplay=True, show_share_button=False, height=512, loop=True) # 结果视频
             gr.Markdown('Note that the ending actions will be generated before the starting actions due to the inverted sampling. If the starting action is not in the video, you just need to wait, and it will be generated later.')
             progress_desc = gr.Markdown('', elem_classes='no-generating-animation') # 进度描述
