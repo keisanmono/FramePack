@@ -101,6 +101,17 @@ outputs_folder = './outputs/'
 os.makedirs(outputs_folder, exist_ok=True)
 
 
+import imageio
+import gc
+import traceback
+import os
+from PIL import Image
+import numpy as np
+import torch
+import einops
+
+# Assuming other necessary imports and global variables (cpu, gpu, high_vram, models, tokenizers, etc.) are defined above
+
 @torch.no_grad()
 def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache):
     total_latent_sections = (total_second_length * 30) / (latent_window_size * 4)
@@ -108,70 +119,147 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
 
     job_id = generate_timestamp()
 
-    # --- [新增] 初始化视频写入相关变量 ---
+    # --- 初始化视频写入相关变量 ---
     output_filename_base = os.path.join(outputs_folder, f'{job_id}')
     output_filename = f"{output_filename_base}.mp4"  # 最终视频文件名
     video_writer = None  # 初始化为 None
-    # --- [结束 新增] ---
+    # --- 结束 初始化 ---
 
     stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'Starting ...'))))
 
     try:
-        # ... (前面清理 GPU、文本编码、图像处理、VAE 编码、CLIP Vision 部分保持不变) ...
+        # --- 清理 GPU ---
+        if not high_vram:
+            unload_complete_models(
+                text_encoder, text_encoder_2, image_encoder, vae, transformer
+            )
 
-        # Dtype (保持不变)
+        # --- 文本编码 ---
+        stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'Text encoding ...'))))
+        if not high_vram:
+            fake_diffusers_current_device(text_encoder, gpu)
+            load_model_as_complete(text_encoder_2, target_device=gpu)
+
+        llama_vec, clip_l_pooler = encode_prompt_conds(prompt, text_encoder, text_encoder_2, tokenizer, tokenizer_2)
+
+        if cfg == 1:
+            llama_vec_n, clip_l_pooler_n = torch.zeros_like(llama_vec), torch.zeros_like(clip_l_pooler)
+        else:
+            llama_vec_n, clip_l_pooler_n = encode_prompt_conds(n_prompt, text_encoder, text_encoder_2, tokenizer, tokenizer_2)
+
+        llama_vec, llama_attention_mask = crop_or_pad_yield_mask(llama_vec, length=512)
+        llama_vec_n, llama_attention_mask_n = crop_or_pad_yield_mask(llama_vec_n, length=512)
+
+        # --- 处理输入图像 ---
+        stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'Image processing ...'))))
+        H, W, C = input_image.shape
+        height, width = find_nearest_bucket(H, W, resolution=640)
+        input_image_np = resize_and_center_crop(input_image, target_width=width, target_height=height)
+        Image.fromarray(input_image_np).save(os.path.join(outputs_folder, f'{job_id}.png'))
+        input_image_pt = torch.from_numpy(input_image_np).float() / 127.5 - 1
+        input_image_pt = input_image_pt.permute(2, 0, 1)[None, :, None]
+
+        # --- VAE 编码 ---
+        stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'VAE encoding ...'))))
+        if not high_vram:
+            load_model_as_complete(vae, target_device=gpu)
+        start_latent = vae_encode(input_image_pt, vae)
+
+        # --- CLIP Vision 编码 ---
+        stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'CLIP Vision encoding ...'))))
+        if not high_vram:
+            load_model_as_complete(image_encoder, target_device=gpu)
+        image_encoder_output = hf_clip_vision_encode(input_image_np, feature_extractor, image_encoder)
+        image_encoder_last_hidden_state = image_encoder_output.last_hidden_state
+
+        # --- Dtype 转换 ---
         llama_vec = llama_vec.to(transformer.dtype)
         llama_vec_n = llama_vec_n.to(transformer.dtype)
         clip_l_pooler = clip_l_pooler.to(transformer.dtype)
         clip_l_pooler_n = clip_l_pooler_n.to(transformer.dtype)
         image_encoder_last_hidden_state = image_encoder_last_hidden_state.to(transformer.dtype)
 
-        # Sampling
-
+        # --- Sampling (采样) ---
         stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'Start sampling ...'))))
-
         rnd = torch.Generator("cpu").manual_seed(seed)
         num_frames = latent_window_size * 4 - 3
-
-        # --- [修改] history_latents 初始化 (保持 float16) ---
         history_latents = torch.zeros(size=(1, 16, 1 + 2 + 16, height // 8, width // 8), dtype=torch.float16).cpu()
-        # --- [删除] 不再需要 history_pixels ---
-        # history_pixels = None
         total_generated_latent_frames = 0
-
         latent_paddings = reversed(range(total_latent_sections))
 
         if total_latent_sections > 4:
             latent_paddings = [3] + [2] * (total_latent_sections - 3) + [1, 0]
 
+        # --- 主采样循环 ---
         for latent_padding in latent_paddings:
             is_last_section = latent_padding == 0
             latent_padding_size = latent_padding * latent_window_size
 
             if stream.input_queue.top() == 'end':
-                # --- [新增] 确保在退出前关闭 writer ---
+                print("User requested end.")
+                # --- 退出前关闭 writer ---
                 if video_writer is not None:
-                    video_writer.close()
-                # --- [结束 新增] ---
+                    try:
+                        video_writer.close()
+                        print("Video writer closed before early exit.")
+                        video_writer = None # 标记为已关闭
+                    except Exception as e_close:
+                        print(f"Error closing video writer on early exit: {e_close}")
+                # --- 结束关闭 ---
                 stream.output_queue.push(('end', None))
-                return
+                return # 直接退出 worker 函数
 
             print(f'latent_padding_size = {latent_padding_size}, is_last_section = {is_last_section}')
 
-            # ... (计算 indices 和 clean_latents 部分保持不变) ...
+            # --- 计算索引和 clean_latents ---
+            indices = torch.arange(0, sum([1, latent_padding_size, latent_window_size, 1, 2, 16])).unsqueeze(0)
+            clean_latent_indices_pre, blank_indices, latent_indices, clean_latent_indices_post, clean_latent_2x_indices, clean_latent_4x_indices = indices.split([1, latent_padding_size, latent_window_size, 1, 2, 16], dim=1)
+            clean_latent_indices = torch.cat([clean_latent_indices_pre, clean_latent_indices_post], dim=1)
             clean_latents_pre = start_latent.to(history_latents.dtype, device=history_latents.device) # 显式类型转换
             clean_latents_post, clean_latents_2x, clean_latents_4x = history_latents[:, :, :1 + 2 + 16, :, :].split([1, 2, 16], dim=2)
             clean_latents = torch.cat([clean_latents_pre, clean_latents_post], dim=2)
 
-
+            # --- 移动 Transformer 模型 ---
             if not high_vram:
                 unload_complete_models()
                 move_model_to_device_with_memory_preservation(transformer, target_device=gpu, preserved_memory_gb=gpu_memory_preservation)
 
-            # ... (TeaCache 初始化 和 callback 定义 保持不变) ...
+            # --- TeaCache 初始化 ---
+            if use_teacache:
+                transformer.initialize_teacache(enable_teacache=True, num_steps=steps)
+            else:
+                transformer.initialize_teacache(enable_teacache=False)
 
+            # --- 定义回调函数 ---
+            def callback(d):
+                try: # 增加 try-except 块以捕获 callback 内部的潜在错误
+                    preview = d['denoised']
+                    preview = vae_decode_fake(preview) # VAE 解码预览
+                    preview = (preview * 127.5 + 127.5).clamp(0, 255).byte() # 转换到 0-255 uint8
+                    preview = preview.cpu().numpy()
+                    # preview = einops.rearrange(preview, 'b c t h w -> (b h) (t w) c') # 重新排列形状
+                    # 调整预览输出格式，取中间一帧或几帧可能更合适
+                    t_idx = preview.shape[2] // 2 # 取时间中间帧
+                    preview = preview[0, :, t_idx, :, :] # [C, H, W]
+                    preview = preview.transpose(1, 2, 0) # [H, W, C] for Gradio Image
+
+                    if stream.input_queue.top() == 'end':
+                        raise KeyboardInterrupt('User ends the task during callback.')
+
+                    current_step = d['i'] + 1
+                    percentage = int(100.0 * current_step / steps)
+                    hint = f'Sampling {current_step}/{steps}'
+                    # 计算大致的已生成视频长度 (latent 帧数 * 4 - 3) / 30 fps
+                    approx_generated_video_frames = max(0, total_generated_latent_frames * 4 - 3)
+                    approx_generated_seconds = approx_generated_video_frames / 30.0
+                    desc = f'Total generated frames: {int(approx_generated_video_frames)}, Video length: {approx_generated_seconds :.2f} seconds (FPS-30). The video is being extended now ...'
+                    stream.output_queue.push(('progress', (preview, desc, make_progress_bar_html(percentage, hint))))
+                except Exception as e_callback:
+                    print(f"Error in callback: {e_callback}") # 打印回调错误，但不中断主流程
+                return
+
+            # --- 执行采样 ---
             generated_latents = sample_hunyuan(
-                # ... (sample_hunyuan 参数保持不变, dtype=torch.float16) ...
                 transformer=transformer,
                 sampler='unipc',
                 width=width,
@@ -201,104 +289,104 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
                 callback=callback,
             )
 
+            # --- 处理采样结果 ---
             if is_last_section:
                 generated_latents = torch.cat([start_latent.to(generated_latents.dtype, device=generated_latents.device), generated_latents], dim=2) # 显式类型
 
             added_latent_frames_count = int(generated_latents.shape[2])
-            start_decode_idx = total_generated_latent_frames # 新帧的起始索引
             total_generated_latent_frames += added_latent_frames_count
 
-            # --- [修改] history_latents 累积 (使用显式类型转换) ---
+            # --- 更新 history_latents ---
             history_latents = torch.cat([generated_latents.to(history_latents.dtype, device=history_latents.device), history_latents], dim=2)
 
-
-            # --- [重写] VAE 解码和流式写入 ---
-            if added_latent_frames_count > 0: # 确保真的生成了新的 latent 帧
+            # --- VAE 解码和流式写入 ---
+            if added_latent_frames_count > 0:
                 if not high_vram:
                     offload_model_from_device_for_memory_preservation(transformer, target_device=gpu, preserved_memory_gb=8)
                     load_model_as_complete(vae, target_device=gpu)
 
-                # 只解码本次循环新生成的 latent 部分
-                latents_to_decode_this_iter = history_latents[:, :, :added_latent_frames_count, :, :] # 解码最新添加的部分
+                # --- 只解码本次循环新生成的 latent 部分 ---
+                # !!! 注意：这里的索引可能需要调整，确保解码的是正确的新帧 !!!
+                # 我们假设 generated_latents 就是当前新生成的，而不是从 history_latents 切片
+                latents_to_decode_this_iter = generated_latents.cpu() # 直接解码生成的 latent，并移到 CPU
 
-                current_pixels_segment = vae_decode(latents_to_decode_this_iter, vae).cpu()
+                current_pixels_segment = vae_decode(latents_to_decode_this_iter.to(vae.dtype, device=vae.device), vae).float().cpu() # 解码到 float32 CPU
 
-                # 转换为 NumPy uint8 格式 [T, H, W, C] for imageio
+                # --- 转换为 NumPy uint8 格式 [T, H, W, C] for imageio ---
                 pixels_np = current_pixels_segment.squeeze(0)  # [C, T, H, W]
                 pixels_np = pixels_np.permute(1, 2, 3, 0)     # [T, H, W, C]
                 pixels_np = (pixels_np * 127.5 + 127.5).clamp(0, 255).byte() # [0, 255] uint8
                 pixels_np = pixels_np.numpy()
 
-                # 初始化视频写入器 (如果需要)
+                # --- 初始化视频写入器 (如果需要) ---
                 if video_writer is None:
                     fps_to_save = 30
-                    # 使用 'libx264' 编码器通常兼容性较好，质量较高
-                    # 'auto' 会自动选择，但有时可能选不到最佳的
-                    video_writer = imageio.get_writer(output_filename, fps=fps_to_save, codec='libx264', quality=8) # quality 可调 (0-10)
+                    video_writer = imageio.get_writer(output_filename, fps=fps_to_save, codec='libx264', quality=8) # 使用 libx264 编码器
 
-                # 将当前段的帧写入视频文件
+                # --- 将当前段的帧写入视频文件 ---
                 for i in range(pixels_np.shape[0]):
                     video_writer.append_data(pixels_np[i])
 
                 # --- 关键：释放内存 ---
                 del current_pixels_segment
                 del pixels_np
-                del latents_to_decode_this_iter # 确保删除临时变量
+                del latents_to_decode_this_iter
                 gc.collect()  # 手动触发垃圾回收
                 # --- 结束关键步骤 ---
 
                 if not high_vram:
                     unload_complete_models(vae) # 用完 VAE 后及时卸载
 
-            # --- [删除] 旧的 history_pixels 累积逻辑 ---
-            # if history_pixels is None: ... else: ... # 全部删除
-
-            # --- [删除] 旧的整段保存逻辑 ---
-            # output_filename = os.path.join(...)
-            # save_bcthw_as_mp4(...)
-
-            # --- [修改] 日志和 Gradio 更新 ---
+            # --- 更新 Gradio 界面 ---
             print(f'Decoded and wrote segment. Total latent frames generated: {total_generated_latent_frames}')
-            if video_writer is not None: # 只有成功写入后才更新 UI
+            if video_writer is not None:
                 stream.output_queue.push(('file', output_filename)) # 持续推送同一个文件名
 
             if is_last_section:
-                break # 保持原来的退出逻辑
+                break # 结束循环
 
-    # --- [新增] 循环正常结束后，关闭写入器 ---
-    if video_writer is not None:
-        video_writer.close()
-        print("Video writer closed successfully.")
+        # --- [修正位置] 循环正常结束后，关闭写入器 (仍然在 try 块内) ---
+        if video_writer is not None:
+            try:
+                video_writer.close()
+                print("Video writer closed successfully after loop completion.")
+                video_writer = None # 标记为已关闭
+            except Exception as e_close:
+                print(f"Error closing video writer after loop completion: {e_close}")
+        # --- [结束 修正位置] ---
 
-except KeyboardInterrupt: # 处理用户中断
-    print("User interrupted the process.")
-    # --- [新增] 中断时也关闭写入器 ---
-    if video_writer is not None:
-        try:
-            video_writer.close()
-            print("Video writer closed after interruption.")
-        except Exception as e_close:
-             print(f"Error closing video writer after interruption: {e_close}")
+    except KeyboardInterrupt: # 处理用户中断
+        print("User interrupted the process.")
+        # --- 中断时关闭写入器 (检查是否为 None) ---
+        if video_writer is not None:
+            try:
+                video_writer.close()
+                print("Video writer closed after interruption.")
+                # video_writer = None # 可选：标记为已关闭
+            except Exception as e_close:
+                 print(f"Error closing video writer after interruption: {e_close}")
 
-except Exception: # 处理其他异常
-    traceback.print_exc()
-    # --- [新增] 异常时也关闭写入器 ---
-    if video_writer is not None:
-        try:
-            video_writer.close()
-            print("Video writer closed after exception.")
-        except Exception as e_close:
-             print(f"Error closing video writer after exception: {e_close}")
+    except Exception: # 处理其他异常
+        traceback.print_exc()
+        # --- 异常时关闭写入器 (检查是否为 None) ---
+        if video_writer is not None:
+            try:
+                video_writer.close()
+                print("Video writer closed after exception.")
+                # video_writer = None # 可选：标记为已关闭
+            except Exception as e_close:
+                 print(f"Error closing video writer after exception: {e_close}")
 
-finally: # 最终清理
-    # 卸载模型（这部分逻辑保持不变）
-    if not high_vram:
-        unload_complete_models(
-            text_encoder, text_encoder_2, image_encoder, vae, transformer
-        )
-    stream.output_queue.push(('end', None)) # 发送结束信号
+    finally: # 最终清理
+        # --- 卸载模型 ---
+        if not high_vram:
+            unload_complete_models(
+                text_encoder, text_encoder_2, image_encoder, vae, transformer
+            )
+        # --- 发送结束信号 ---
+        stream.output_queue.push(('end', None))
 
-# worker 函数末尾不需要显式 return
+# 注意：worker 函数末尾没有显式的 return 语句
 
 def process(input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache):
     global stream
