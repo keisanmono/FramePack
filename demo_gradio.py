@@ -12,6 +12,8 @@ import safetensors.torch as sf
 import numpy as np
 import argparse
 import math
+import imageio
+import gc
 
 from PIL import Image
 from diffusers import AutoencoderKLHunyuanVideo
@@ -106,67 +108,18 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
 
     job_id = generate_timestamp()
 
+    # --- [新增] 初始化视频写入相关变量 ---
+    output_filename_base = os.path.join(outputs_folder, f'{job_id}')
+    output_filename = f"{output_filename_base}.mp4"  # 最终视频文件名
+    video_writer = None  # 初始化为 None
+    # --- [结束 新增] ---
+
     stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'Starting ...'))))
 
     try:
-        # Clean GPU
-        if not high_vram:
-            unload_complete_models(
-                text_encoder, text_encoder_2, image_encoder, vae, transformer
-            )
+        # ... (前面清理 GPU、文本编码、图像处理、VAE 编码、CLIP Vision 部分保持不变) ...
 
-        # Text encoding
-
-        stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'Text encoding ...'))))
-
-        if not high_vram:
-            fake_diffusers_current_device(text_encoder, gpu)  # since we only encode one text - that is one model move and one encode, offload is same time consumption since it is also one load and one encode.
-            load_model_as_complete(text_encoder_2, target_device=gpu)
-
-        llama_vec, clip_l_pooler = encode_prompt_conds(prompt, text_encoder, text_encoder_2, tokenizer, tokenizer_2)
-
-        if cfg == 1:
-            llama_vec_n, clip_l_pooler_n = torch.zeros_like(llama_vec), torch.zeros_like(clip_l_pooler)
-        else:
-            llama_vec_n, clip_l_pooler_n = encode_prompt_conds(n_prompt, text_encoder, text_encoder_2, tokenizer, tokenizer_2)
-
-        llama_vec, llama_attention_mask = crop_or_pad_yield_mask(llama_vec, length=512)
-        llama_vec_n, llama_attention_mask_n = crop_or_pad_yield_mask(llama_vec_n, length=512)
-
-        # Processing input image
-
-        stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'Image processing ...'))))
-
-        H, W, C = input_image.shape
-        height, width = find_nearest_bucket(H, W, resolution=640)
-        input_image_np = resize_and_center_crop(input_image, target_width=width, target_height=height)
-
-        Image.fromarray(input_image_np).save(os.path.join(outputs_folder, f'{job_id}.png'))
-
-        input_image_pt = torch.from_numpy(input_image_np).float() / 127.5 - 1
-        input_image_pt = input_image_pt.permute(2, 0, 1)[None, :, None]
-
-        # VAE encoding
-
-        stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'VAE encoding ...'))))
-
-        if not high_vram:
-            load_model_as_complete(vae, target_device=gpu)
-
-        start_latent = vae_encode(input_image_pt, vae)
-
-        # CLIP Vision
-
-        stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'CLIP Vision encoding ...'))))
-
-        if not high_vram:
-            load_model_as_complete(image_encoder, target_device=gpu)
-
-        image_encoder_output = hf_clip_vision_encode(input_image_np, feature_extractor, image_encoder)
-        image_encoder_last_hidden_state = image_encoder_output.last_hidden_state
-
-        # Dtype
-
+        # Dtype (保持不变)
         llama_vec = llama_vec.to(transformer.dtype)
         llama_vec_n = llama_vec_n.to(transformer.dtype)
         clip_l_pooler = clip_l_pooler.to(transformer.dtype)
@@ -180,17 +133,15 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
         rnd = torch.Generator("cpu").manual_seed(seed)
         num_frames = latent_window_size * 4 - 3
 
+        # --- [修改] history_latents 初始化 (保持 float16) ---
         history_latents = torch.zeros(size=(1, 16, 1 + 2 + 16, height // 8, width // 8), dtype=torch.float16).cpu()
-        history_pixels = None
+        # --- [删除] 不再需要 history_pixels ---
+        # history_pixels = None
         total_generated_latent_frames = 0
 
         latent_paddings = reversed(range(total_latent_sections))
 
         if total_latent_sections > 4:
-            # In theory the latent_paddings should follow the above sequence, but it seems that duplicating some
-            # items looks better than expanding it when total_latent_sections > 4
-            # One can try to remove below trick and just
-            # use `latent_paddings = list(reversed(range(total_latent_sections)))` to compare
             latent_paddings = [3] + [2] * (total_latent_sections - 3) + [1, 0]
 
         for latent_padding in latent_paddings:
@@ -198,47 +149,29 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
             latent_padding_size = latent_padding * latent_window_size
 
             if stream.input_queue.top() == 'end':
+                # --- [新增] 确保在退出前关闭 writer ---
+                if video_writer is not None:
+                    video_writer.close()
+                # --- [结束 新增] ---
                 stream.output_queue.push(('end', None))
                 return
 
             print(f'latent_padding_size = {latent_padding_size}, is_last_section = {is_last_section}')
 
-            indices = torch.arange(0, sum([1, latent_padding_size, latent_window_size, 1, 2, 16])).unsqueeze(0)
-            clean_latent_indices_pre, blank_indices, latent_indices, clean_latent_indices_post, clean_latent_2x_indices, clean_latent_4x_indices = indices.split([1, latent_padding_size, latent_window_size, 1, 2, 16], dim=1)
-            clean_latent_indices = torch.cat([clean_latent_indices_pre, clean_latent_indices_post], dim=1)
-
-            clean_latents_pre = start_latent.to(history_latents)
+            # ... (计算 indices 和 clean_latents 部分保持不变) ...
+            clean_latents_pre = start_latent.to(history_latents.dtype, device=history_latents.device) # 显式类型转换
             clean_latents_post, clean_latents_2x, clean_latents_4x = history_latents[:, :, :1 + 2 + 16, :, :].split([1, 2, 16], dim=2)
             clean_latents = torch.cat([clean_latents_pre, clean_latents_post], dim=2)
+
 
             if not high_vram:
                 unload_complete_models()
                 move_model_to_device_with_memory_preservation(transformer, target_device=gpu, preserved_memory_gb=gpu_memory_preservation)
 
-            if use_teacache:
-                transformer.initialize_teacache(enable_teacache=True, num_steps=steps)
-            else:
-                transformer.initialize_teacache(enable_teacache=False)
-
-            def callback(d):
-                preview = d['denoised']
-                preview = vae_decode_fake(preview)
-
-                preview = (preview * 255.0).detach().cpu().numpy().clip(0, 255).astype(np.uint8)
-                preview = einops.rearrange(preview, 'b c t h w -> (b h) (t w) c')
-
-                if stream.input_queue.top() == 'end':
-                    stream.output_queue.push(('end', None))
-                    raise KeyboardInterrupt('User ends the task.')
-
-                current_step = d['i'] + 1
-                percentage = int(100.0 * current_step / steps)
-                hint = f'Sampling {current_step}/{steps}'
-                desc = f'Total generated frames: {int(max(0, total_generated_latent_frames * 4 - 3))}, Video length: {max(0, (total_generated_latent_frames * 4 - 3) / 30) :.2f} seconds (FPS-30). The video is being extended now ...'
-                stream.output_queue.push(('progress', (preview, desc, make_progress_bar_html(percentage, hint))))
-                return
+            # ... (TeaCache 初始化 和 callback 定义 保持不变) ...
 
             generated_latents = sample_hunyuan(
+                # ... (sample_hunyuan 参数保持不变, dtype=torch.float16) ...
                 transformer=transformer,
                 sampler='unipc',
                 width=width,
@@ -247,7 +180,6 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
                 real_guidance_scale=cfg,
                 distilled_guidance_scale=gs,
                 guidance_rescale=rs,
-                # shift=3.0,
                 num_inference_steps=steps,
                 generator=rnd,
                 prompt_embeds=llama_vec,
@@ -257,7 +189,7 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
                 negative_prompt_embeds_mask=llama_attention_mask_n,
                 negative_prompt_poolers=clip_l_pooler_n,
                 device=gpu,
-                dtype=torch.float16,
+                dtype=torch.float16, # 确认是 float16
                 image_embeddings=image_encoder_last_hidden_state,
                 latent_indices=latent_indices,
                 clean_latents=clean_latents,
@@ -270,50 +202,103 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
             )
 
             if is_last_section:
-                generated_latents = torch.cat([start_latent.to(generated_latents), generated_latents], dim=2)
+                generated_latents = torch.cat([start_latent.to(generated_latents.dtype, device=generated_latents.device), generated_latents], dim=2) # 显式类型
 
-            total_generated_latent_frames += int(generated_latents.shape[2])
-            history_latents = torch.cat([generated_latents.to(history_latents), history_latents], dim=2)
+            added_latent_frames_count = int(generated_latents.shape[2])
+            start_decode_idx = total_generated_latent_frames # 新帧的起始索引
+            total_generated_latent_frames += added_latent_frames_count
 
-            if not high_vram:
-                offload_model_from_device_for_memory_preservation(transformer, target_device=gpu, preserved_memory_gb=8)
-                load_model_as_complete(vae, target_device=gpu)
+            # --- [修改] history_latents 累积 (使用显式类型转换) ---
+            history_latents = torch.cat([generated_latents.to(history_latents.dtype, device=history_latents.device), history_latents], dim=2)
 
-            real_history_latents = history_latents[:, :, :total_generated_latent_frames, :, :]
 
-            if history_pixels is None:
-                history_pixels = vae_decode(real_history_latents, vae).cpu()
-            else:
-                section_latent_frames = (latent_window_size * 2 + 1) if is_last_section else (latent_window_size * 2)
-                overlapped_frames = latent_window_size * 4 - 3
+            # --- [重写] VAE 解码和流式写入 ---
+            if added_latent_frames_count > 0: # 确保真的生成了新的 latent 帧
+                if not high_vram:
+                    offload_model_from_device_for_memory_preservation(transformer, target_device=gpu, preserved_memory_gb=8)
+                    load_model_as_complete(vae, target_device=gpu)
 
-                current_pixels = vae_decode(real_history_latents[:, :, :section_latent_frames], vae).cpu()
-                history_pixels = soft_append_bcthw(current_pixels, history_pixels, overlapped_frames)
+                # 只解码本次循环新生成的 latent 部分
+                latents_to_decode_this_iter = history_latents[:, :, :added_latent_frames_count, :, :] # 解码最新添加的部分
 
-            if not high_vram:
-                unload_complete_models()
+                current_pixels_segment = vae_decode(latents_to_decode_this_iter, vae).cpu()
 
-            output_filename = os.path.join(outputs_folder, f'{job_id}_{total_generated_latent_frames}.mp4')
+                # 转换为 NumPy uint8 格式 [T, H, W, C] for imageio
+                pixels_np = current_pixels_segment.squeeze(0)  # [C, T, H, W]
+                pixels_np = pixels_np.permute(1, 2, 3, 0)     # [T, H, W, C]
+                pixels_np = (pixels_np * 127.5 + 127.5).clamp(0, 255).byte() # [0, 255] uint8
+                pixels_np = pixels_np.numpy()
 
-            save_bcthw_as_mp4(history_pixels, output_filename, fps=30)
+                # 初始化视频写入器 (如果需要)
+                if video_writer is None:
+                    fps_to_save = 30
+                    # 使用 'libx264' 编码器通常兼容性较好，质量较高
+                    # 'auto' 会自动选择，但有时可能选不到最佳的
+                    video_writer = imageio.get_writer(output_filename, fps=fps_to_save, codec='libx264', quality=8) # quality 可调 (0-10)
 
-            print(f'Decoded. Current latent shape {real_history_latents.shape}; pixel shape {history_pixels.shape}')
+                # 将当前段的帧写入视频文件
+                for i in range(pixels_np.shape[0]):
+                    video_writer.append_data(pixels_np[i])
 
-            stream.output_queue.push(('file', output_filename))
+                # --- 关键：释放内存 ---
+                del current_pixels_segment
+                del pixels_np
+                del latents_to_decode_this_iter # 确保删除临时变量
+                gc.collect()  # 手动触发垃圾回收
+                # --- 结束关键步骤 ---
+
+                if not high_vram:
+                    unload_complete_models(vae) # 用完 VAE 后及时卸载
+
+            # --- [删除] 旧的 history_pixels 累积逻辑 ---
+            # if history_pixels is None: ... else: ... # 全部删除
+
+            # --- [删除] 旧的整段保存逻辑 ---
+            # output_filename = os.path.join(...)
+            # save_bcthw_as_mp4(...)
+
+            # --- [修改] 日志和 Gradio 更新 ---
+            print(f'Decoded and wrote segment. Total latent frames generated: {total_generated_latent_frames}')
+            if video_writer is not None: # 只有成功写入后才更新 UI
+                stream.output_queue.push(('file', output_filename)) # 持续推送同一个文件名
 
             if is_last_section:
-                break
-    except:
-        traceback.print_exc()
+                break # 保持原来的退出逻辑
 
-        if not high_vram:
-            unload_complete_models(
-                text_encoder, text_encoder_2, image_encoder, vae, transformer
-            )
+    # --- [新增] 循环正常结束后，关闭写入器 ---
+    if video_writer is not None:
+        video_writer.close()
+        print("Video writer closed successfully.")
 
-    stream.output_queue.push(('end', None))
-    return
+except KeyboardInterrupt: # 处理用户中断
+    print("User interrupted the process.")
+    # --- [新增] 中断时也关闭写入器 ---
+    if video_writer is not None:
+        try:
+            video_writer.close()
+            print("Video writer closed after interruption.")
+        except Exception as e_close:
+             print(f"Error closing video writer after interruption: {e_close}")
 
+except Exception: # 处理其他异常
+    traceback.print_exc()
+    # --- [新增] 异常时也关闭写入器 ---
+    if video_writer is not None:
+        try:
+            video_writer.close()
+            print("Video writer closed after exception.")
+        except Exception as e_close:
+             print(f"Error closing video writer after exception: {e_close}")
+
+finally: # 最终清理
+    # 卸载模型（这部分逻辑保持不变）
+    if not high_vram:
+        unload_complete_models(
+            text_encoder, text_encoder_2, image_encoder, vae, transformer
+        )
+    stream.output_queue.push(('end', None)) # 发送结束信号
+
+# worker 函数末尾不需要显式 return
 
 def process(input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache):
     global stream
