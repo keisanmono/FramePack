@@ -3,7 +3,8 @@ from diffusers_helper.hf_login import login
 import os
 
 # 设置 Hugging Face 下载缓存目录
-script_dir = os.path.dirname(__file__) if '__file__' in locals() else '.' # 处理 Notebook 环境
+# script_dir = os.path.dirname(__file__) if '__file__' in locals() else '.' # 处理 Notebook 环境
+script_dir = '/kaggle/temp/FramePack/' # Hardcode path for Kaggle temp if needed, or keep dynamic
 hf_download_path = os.path.abspath(os.path.realpath(os.path.join(script_dir, './hf_download')))
 os.environ['HF_HOME'] = hf_download_path
 print(f"HF_HOME set to: {hf_download_path}")
@@ -12,7 +13,7 @@ import gradio as gr
 import torch
 import traceback
 import einops
-# import safetensors.torch as sf # Safetensors 可能由 accelerate 处理，暂时注释掉
+# import safetensors.torch as sf # Safetensors 可能由 accelerate 处理
 import numpy as np
 import argparse
 import math
@@ -32,7 +33,7 @@ from diffusers_helper.utils import save_bcthw_as_mp4, crop_or_pad_yield_mask, so
 from diffusers_helper.models.hunyuan_video_packed import HunyuanVideoTransformer3DModelPacked
 from diffusers_helper.pipelines.k_diffusion_hunyuan import sample_hunyuan
 # --- 移除手动内存管理相关的导入 ---
-# from diffusers_helper.memory import cpu, gpu, get_cuda_free_memory_gb, move_model_to_device_with_memory_preservation, offload_model_from_device_for_memory_preservation, fake_diffusers_current_device, DynamicSwapInstaller, unload_complete_models, load_model_as_complete
+# from diffusers_helper.memory import ... # 移除大部分
 from diffusers_helper.memory import cpu, gpu # 可能仍然需要 cpu, gpu 定义
 from diffusers_helper.thread_utils import AsyncStream, async_run
 from diffusers_helper.gradio.progress_bar import make_progress_bar_css, make_progress_bar_html
@@ -51,10 +52,9 @@ args = parser.parse_args()
 print(args)
 
 # --- 获取计算设备 ---
-# Accelerate 通常会自动选择，但我们保留 gpu 变量用于手动移动 VAE 等
 if torch.cuda.is_available():
-    gpu = torch.device("cuda:0") # 默认使用第一个 GPU
-    torch.cuda.empty_cache() # 清理显存
+    gpu = torch.device("cuda:0")
+    torch.cuda.empty_cache()
 else:
     gpu = torch.device("cpu")
 print(f"Primary compute device selected: {gpu}")
@@ -62,30 +62,33 @@ print(f"Primary compute device selected: {gpu}")
 
 # --- 使用 Accelerate 加载支持 device_map 的模型，手动加载不支持的 ---
 print("Loading models...")
+# 使用字典来存储模型，方便后续管理
+models = {}
 try:
     # Accelerate 会处理这些模型的设备放置
     print("Loading text_encoder with device_map='auto'...")
-    text_encoder = LlamaModel.from_pretrained(
+    models['text_encoder'] = LlamaModel.from_pretrained(
         "hunyuanvideo-community/HunyuanVideo", subfolder='text_encoder', torch_dtype=torch.float16,
         device_map="auto", low_cpu_mem_usage=True
     )
     gc.collect(); torch.cuda.empty_cache()
     print("Loading text_encoder_2 with device_map='auto'...")
-    text_encoder_2 = CLIPTextModel.from_pretrained(
+    models['text_encoder_2'] = CLIPTextModel.from_pretrained(
         "hunyuanvideo-community/HunyuanVideo", subfolder='text_encoder_2', torch_dtype=torch.float16,
         device_map="auto", low_cpu_mem_usage=True
     )
     gc.collect(); torch.cuda.empty_cache()
-    print("Loading transformer with device_map='auto'...")
-    transformer = HunyuanVideoTransformer3DModelPacked.from_pretrained(
-        'lllyasviel/FramePackI2V_HY', torch_dtype=torch.float16,
-        device_map="auto", low_cpu_mem_usage=True
-    )
+
+    # 手动加载 Transformer 到 CPU
+    print("Loading Transformer to CPU (device_map not supported)...")
+    models['transformer'] = HunyuanVideoTransformer3DModelPacked.from_pretrained(
+        'lllyasviel/FramePackI2V_HY', torch_dtype=torch.float16
+    ).cpu()
     gc.collect(); torch.cuda.empty_cache()
 
-    # 手动加载不支持 device_map 的 VAE 到 CPU
+    # 手动加载 VAE 到 CPU
     print("Loading VAE to CPU (device_map not supported)...")
-    vae = AutoencoderKLHunyuanVideo.from_pretrained(
+    models['vae'] = AutoencoderKLHunyuanVideo.from_pretrained(
         "hunyuanvideo-community/HunyuanVideo", subfolder='vae', torch_dtype=torch.float16
     ).cpu()
     gc.collect(); torch.cuda.empty_cache()
@@ -93,19 +96,19 @@ try:
     # 尝试用 device_map 加载 Image Encoder，失败则回退到 CPU
     print("Attempting to load image_encoder with device_map='auto'...")
     try:
-        image_encoder = SiglipVisionModel.from_pretrained(
+        models['image_encoder'] = SiglipVisionModel.from_pretrained(
             "lllyasviel/flux_redux_bfl", subfolder='image_encoder', torch_dtype=torch.float16,
             device_map="auto", low_cpu_mem_usage=True
         )
         print("Loaded image_encoder with device_map.")
     except ValueError:
         print(f"Warning: image_encoder does not support device_map='auto'. Loading to CPU instead.")
-        image_encoder = SiglipVisionModel.from_pretrained(
+        models['image_encoder'] = SiglipVisionModel.from_pretrained(
             "lllyasviel/flux_redux_bfl", subfolder='image_encoder', torch_dtype=torch.float16
         ).cpu()
     except Exception as e_img_enc:
-        print(f"Warning: Failed to load image_encoder with device_map='auto': {e_img_enc}. Loading to CPU instead.")
-        image_encoder = SiglipVisionModel.from_pretrained(
+        print(f"Warning: Failed to load image_encoder: {e_img_enc}. Loading to CPU instead.")
+        models['image_encoder'] = SiglipVisionModel.from_pretrained(
             "lllyasviel/flux_redux_bfl", subfolder='image_encoder', torch_dtype=torch.float16
         ).cpu()
     gc.collect(); torch.cuda.empty_cache()
@@ -124,14 +127,14 @@ except Exception as e_load:
     exit()
 
 # --- 设置模型为评估模式 ---
-vae.eval()
-text_encoder.eval()
-text_encoder_2.eval()
-image_encoder.eval()
-transformer.eval()
+models['vae'].eval()
+models['text_encoder'].eval()
+models['text_encoder_2'].eval()
+models['image_encoder'].eval()
+models['transformer'].eval()
 
 # --- Transformer 特定设置 ---
-transformer.high_quality_fp32_output_for_inference = True
+models['transformer'].high_quality_fp32_output_for_inference = True
 print('transformer.high_quality_fp32_output_for_inference = True')
 
 # --- 初始化异步流和输出目录 ---
@@ -142,29 +145,35 @@ os.makedirs(outputs_folder, exist_ok=True)
 
 # --- Worker 函数定义 ---
 @torch.no_grad()
-def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, use_teacache): # 移除 gpu_memory_preservation
+def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, use_teacache):
+
+    # 从全局字典获取模型引用
+    text_encoder = models['text_encoder']
+    text_encoder_2 = models['text_encoder_2']
+    vae = models['vae']
+    image_encoder = models['image_encoder']
+    transformer = models['transformer']
 
     total_latent_sections = (total_second_length * 30) / (latent_window_size * 4)
     total_latent_sections = int(max(round(total_latent_sections), 1))
     job_id = generate_timestamp()
 
-    # --- 初始化视频写入相关变量 ---
     output_filename_base = os.path.join(outputs_folder, f'{job_id}')
     output_filename = f"{output_filename_base}.mp4"
     video_writer = None
-    # --- 结束 初始化 ---
 
     stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'Starting ...'))))
+    compute_device = gpu
 
-    # --- 获取主计算设备 ---
-    compute_device = gpu # 使用之前定义的 gpu 设备 ('cuda:0' 或 'cpu')
+    transformer_on_gpu = False # 跟踪 Transformer 是否已移到 GPU
+    vae_on_gpu = False       # 跟踪 VAE 是否已移到 GPU
+    image_encoder_on_gpu = False # 跟踪 Image Encoder 是否已移到 GPU
 
     try:
         # --- 文本编码 ---
         stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'Text encoding ...'))))
-        # 调用编码函数 (hunyuan.py 中的代码会将 input_ids 移到 model.device)
         print("Starting text encoding...")
-        # 确保 encode_prompt_conds 能处理分布式的 text_encoder 和 text_encoder_2
+        # encode_prompt_conds 内部会将输入移到 model.device
         llama_vec, clip_l_pooler = encode_prompt_conds(prompt, text_encoder, text_encoder_2, tokenizer, tokenizer_2)
         print("Text encoding finished.")
 
@@ -179,51 +188,38 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
 
         # --- VAE 编码 ---
         stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'VAE encoding ...'))))
-        # --- 手动加载 VAE 到 GPU ---
         print("Moving VAE to GPU for encoding...")
-        vae.to(gpu)
+        vae.to(gpu); vae_on_gpu = True
         gc.collect(); torch.cuda.empty_cache()
         print("VAE moved to GPU.")
-        # --- 结束 ---
         print("Starting VAE encoding...")
-        # 确保 input_image_pt 在 VAE 设备上
-        start_latent = vae_encode(input_image_pt.to(vae.device, dtype=vae.dtype), vae)
-        print(f"VAE encoding finished. Start latent shape: {start_latent.shape}, dtype: {start_latent.dtype}, device: {start_latent.device}")
-        # --- VAE 编码后移回 CPU ---
+        start_latent = vae_encode(input_image_pt.to(device=vae.device, dtype=vae.dtype), vae)
+        print(f"VAE encoding finished...")
         print("Moving VAE back to CPU...")
-        vae.to(cpu)
+        vae.to(cpu); vae_on_gpu = False
         gc.collect(); torch.cuda.empty_cache()
         print("VAE moved to CPU.")
-        # --- 结束 ---
-        # 将 latent 移到主计算设备 compute_device
-        start_latent = start_latent.to(compute_device)
+        start_latent = start_latent.to(compute_device) # 移动 latent 到主计算设备
         print(f"Start latent moved to {compute_device}")
 
 
         # --- CLIP Vision 编码 ---
         stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'CLIP Vision encoding ...'))))
-        # --- 如果 image_encoder 在 CPU，手动移到 GPU ---
-        moved_image_encoder = False
-        if hasattr(image_encoder, 'device') and image_encoder.device == torch.device('cpu'): # 检查是否需要移动
+        # 检查 image_encoder 是否在 CPU 且需要移动
+        if hasattr(image_encoder, 'device') and image_encoder.device == torch.device('cpu'):
             print("Moving Image Encoder to GPU for encoding...")
-            image_encoder.to(gpu)
-            moved_image_encoder = True
+            image_encoder.to(gpu); image_encoder_on_gpu = True
             gc.collect(); torch.cuda.empty_cache()
             print("Image Encoder moved to GPU.")
-        # --- 结束 ---
         print("Starting CLIP Vision encoding...")
-        # 确保 hf_clip_vision_encode 能处理 NumPy 输入和可能在 GPU 的模型
         image_encoder_output = hf_clip_vision_encode(input_image_np, feature_extractor, image_encoder)
         image_encoder_last_hidden_state = image_encoder_output.last_hidden_state
-        print(f"CLIP Vision encoding finished. Hidden state device: {image_encoder_last_hidden_state.device}")
-        # --- 编码后移回 CPU (如果之前移动了) ---
-        if moved_image_encoder:
+        print(f"CLIP Vision encoding finished...")
+        if image_encoder_on_gpu: # 如果之前移动了，移回 CPU
              print("Moving Image Encoder back to CPU...")
-             image_encoder.to(cpu)
+             image_encoder.to(cpu); image_encoder_on_gpu = False
              gc.collect(); torch.cuda.empty_cache()
              print("Image Encoder moved to CPU.")
-        # --- 结束 ---
-        # 将 hidden_state 移到主计算设备
         image_encoder_last_hidden_state = image_encoder_last_hidden_state.to(compute_device)
         print(f"Image encoder hidden state moved to {compute_device}")
 
@@ -236,6 +232,14 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
         clip_l_pooler_n = clip_l_pooler_n.to(compute_device, dtype=torch.float16)
         image_encoder_last_hidden_state = image_encoder_last_hidden_state.to(compute_device, dtype=torch.float16)
         print("Embeddings and poolers moved and converted to float16 on compute device.")
+
+
+        # --- 将 Transformer 移到 GPU (在采样循环开始前) ---
+        print("Moving Transformer to GPU for sampling...")
+        transformer.to(gpu); transformer_on_gpu = True
+        gc.collect(); torch.cuda.empty_cache()
+        print("Transformer moved to GPU.")
+        # --- 结束 ---
 
 
         # --- Sampling (采样) ---
@@ -261,6 +265,15 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
                     except Exception as e: print(f"Error closing video writer on early exit: {e}")
                     video_writer = None
                 stream.output_queue.push(('end', None))
+                # --- [修改] 退出前尝试将 Transformer 移回 CPU ---
+                if transformer_on_gpu:
+                    try:
+                        print("Moving Transformer back to CPU before early exit...")
+                        transformer.to(cpu); transformer_on_gpu = False
+                        gc.collect(); torch.cuda.empty_cache()
+                    except Exception as e_trans_unload:
+                        print(f"Error moving Transformer to CPU on early exit: {e_trans_unload}")
+                # --- [结束 修改] ---
                 return
 
             print(f'latent_padding_size = {latent_padding_size}, is_last_section = {is_last_section}')
@@ -277,9 +290,17 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
             def callback(d):
                 try:
                     preview = d['denoised']
-                    # VAE 可能在 CPU，需要移到 GPU
-                    preview_vae_device = gpu # 假设 VAE 会被移到 gpu
-                    preview = vae_decode_fake(preview.to(preview_vae_device)) # 移到 GPU 再 fake decode
+                    # --- VAE 可能在 CPU，需要移到 GPU 进行 fake decode ---
+                    preview_vae_device = gpu # 假设移动到主 GPU
+                    moved_vae_for_preview = False
+                    if hasattr(vae, 'device') and vae.device == torch.device('cpu'):
+                        vae.to(preview_vae_device); moved_vae_for_preview = True
+                    # --- 结束 ---
+                    preview = vae_decode_fake(preview.to(preview_vae_device)) # 移到 VAE 设备再解码
+                    # --- 如果移动了 VAE，移回 CPU ---
+                    if moved_vae_for_preview:
+                        vae.to(cpu)
+                    # --- 结束 ---
                     preview = (preview * 127.5 + 127.5).clamp(0, 255).byte()
                     preview = preview.cpu().numpy()
                     t_idx = preview.shape[2] // 2
@@ -301,12 +322,9 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
                 return
 
             # --- 执行采样 ---
-            # 确保传递给 sample_hunyuan 的张量在正确的设备上
             print("Starting sampling...")
-            # 注意：transformer 可能部分在 CPU 部分在 GPU (被 Accelerate 分配)
-            # sample_hunyuan 内部需要能处理这种情况，或者我们把所有输入都放到 compute_device
             generated_latents = sample_hunyuan(
-                transformer=transformer, # 由 Accelerate 管理
+                transformer=transformer, # 已经在 GPU 上
                 sampler='unipc',
                 width=width,
                 height=height,
@@ -316,26 +334,26 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
                 guidance_rescale=rs,
                 num_inference_steps=steps,
                 generator=rnd,
-                prompt_embeds=llama_vec.to(compute_device), # 确保在 compute_device
+                prompt_embeds=llama_vec.to(compute_device),
                 prompt_embeds_mask=llama_attention_mask.to(compute_device),
                 prompt_poolers=clip_l_pooler.to(compute_device),
                 negative_prompt_embeds=llama_vec_n.to(compute_device),
                 negative_prompt_embeds_mask=llama_attention_mask_n.to(compute_device),
                 negative_prompt_poolers=clip_l_pooler_n.to(compute_device),
-                device=compute_device, # 指定主计算设备
+                device=compute_device,
                 dtype=torch.float16,
-                image_embeddings=image_encoder_last_hidden_state.to(compute_device), # 确保在 compute_device
+                image_embeddings=image_encoder_last_hidden_state.to(compute_device),
                 latent_indices=latent_indices,
-                clean_latents=clean_latents.to(device=compute_device, dtype=torch.float16), # 移到 compute_device
+                clean_latents=clean_latents.to(device=compute_device, dtype=torch.float16),
                 clean_latent_indices=clean_latent_indices,
-                clean_latents_2x=clean_latents_2x.to(device=compute_device, dtype=torch.float16), # 移到 compute_device
+                clean_latents_2x=clean_latents_2x.to(device=compute_device, dtype=torch.float16),
                 clean_latent_2x_indices=clean_latent_2x_indices,
-                clean_latents_4x=clean_latents_4x.to(device=compute_device, dtype=torch.float16), # 移到 compute_device
+                clean_latents_4x=clean_latents_4x.to(device=compute_device, dtype=torch.float16),
                 clean_latent_4x_indices=clean_latent_4x_indices,
                 callback=callback,
             )
             print("Sampling finished for this section.")
-            # generated_latents 在 compute_device 上
+            # generated_latents 在 compute_device (gpu) 上
 
             # --- 处理采样结果 ---
             if is_last_section:
@@ -351,19 +369,18 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
             if added_latent_frames_count > 0:
                 # --- 手动加载 VAE 到 GPU ---
                 print("Moving VAE to GPU for decoding...")
-                vae.to(gpu)
+                vae.to(gpu); vae_on_gpu = True
                 gc.collect(); torch.cuda.empty_cache()
                 print("VAE moved to GPU.")
                 # --- 结束 ---
 
                 latents_to_decode_this_iter = history_latents[:, :, :added_latent_frames_count, :, :] # 从 history 切片 (在 CPU)
-                # --- 确保传递给 vae_decode 的 latent 在 VAE 设备上且类型正确 ---
                 current_pixels_segment = vae_decode(latents_to_decode_this_iter.to(device=vae.device, dtype=vae.dtype), vae).float().cpu() # 解码到 float32 CPU
                 print("VAE decoding for writing finished.")
 
                 # --- 解码后移回 CPU ---
                 print("Moving VAE back to CPU...")
-                vae.to(cpu)
+                vae.to(cpu); vae_on_gpu = False
                 gc.collect(); torch.cuda.empty_cache()
                 print("VAE moved to CPU.")
                 # --- 结束 ---
@@ -400,42 +417,66 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
                 stream.output_queue.push(('file', output_filename))
 
             if is_last_section:
-                break
+                break # 结束循环
 
         # --- 循环正常结束后，关闭写入器 ---
-        if video_writer is not None:
-            try:
-                print("Closing video writer after loop completion...")
-                video_writer.close()
-                print("Video writer closed successfully after loop completion.")
-                video_writer = None
-            except Exception as e_close:
-                print(f"Error closing video writer after loop completion: {e_close}")
+        # 这个逻辑移到下面的 finally 块中更安全
 
     except KeyboardInterrupt: # 处理用户中断
         print("User interrupted the process.")
-        if video_writer is not None:
-            try: video_writer.close(); print("Video writer closed after interruption.")
-            except Exception as e: print(f"Error closing video writer after interruption: {e}")
+        # 关闭 writer 的逻辑在 finally 中处理
 
     except Exception: # 处理其他异常
         traceback.print_exc()
-        if video_writer is not None:
-            try: video_writer.close(); print("Video writer closed after exception.")
-            except Exception as e: print(f"Error closing video writer after exception: {e}")
+        # 关闭 writer 的逻辑在 finally 中处理
 
     finally: # 最终清理
         print("Entering finally block...")
+        # --- [修改] 确保关闭 Writer ---
+        if video_writer is not None:
+            try:
+                print("Closing video writer in finally block...")
+                video_writer.close()
+                print("Video writer closed successfully in finally.")
+            except Exception as e_close:
+                print(f"Error closing video writer in finally: {e_close}")
+            video_writer = None # 标记已处理
+
+        # --- [修改] 确保将模型移回 CPU (如果还在 GPU 上) ---
+        if transformer_on_gpu:
+            try:
+                print("Moving Transformer back to CPU in finally...")
+                transformer.to(cpu)
+                transformer_on_gpu = False
+            except Exception as e_trans_unload:
+                print(f"Error moving Transformer to CPU in finally: {e_trans_unload}")
+        if vae_on_gpu:
+             try:
+                 print("Moving VAE back to CPU in finally...")
+                 vae.to(cpu)
+                 vae_on_gpu = False
+             except Exception as e_vae_unload:
+                  print(f"Error moving VAE to CPU in finally: {e_vae_unload}")
+        if image_encoder_on_gpu:
+             try:
+                 print("Moving Image Encoder back to CPU in finally...")
+                 image_encoder.to(cpu)
+                 image_encoder_on_gpu = False
+             except Exception as e_img_unload:
+                  print(f"Error moving Image Encoder to CPU in finally: {e_img_unload}")
+
         # --- 尝试释放 Accelerate 管理的模型 ---
         try:
-            print("Releasing models managed by Accelerate...")
-            release_memory(text_encoder, text_encoder_2, transformer) # 释放支持 device_map 的模型
-            # 手动加载的模型（VAE, Image Encoder）也尝试 del
-            if 'vae' in locals(): del vae
-            if 'image_encoder' in locals(): del image_encoder
+            print("Releasing models potentially managed by Accelerate...")
+            release_memory(models.get('text_encoder'), models.get('text_encoder_2')) # 只释放支持 device_map 的
+            # 手动加载的模型（VAE, Image Encoder, Transformer）也尝试 del
+            # del models['vae'] # 直接 del 可能导致下次调用 worker 出错，不清空全局 models 字典
+            # del models['image_encoder']
+            # del models['transformer']
+            print("Attempting final garbage collection and cache clearing...")
             gc.collect()
             torch.cuda.empty_cache()
-            print("Memory released.")
+            print("Memory release attempted.")
         except Exception as e_release:
             print(f"Error during final memory release: {e_release}")
         # --- 发送结束信号 ---
