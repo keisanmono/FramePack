@@ -21,8 +21,8 @@ import imageio
 import gc
 
 # --- 导入 Accelerate ---
-from accelerate import Accelerator
-from accelerate.utils import release_memory
+from accelerate import Accelerator # 主要用于 device_map
+from accelerate.utils import release_memory # 用于尝试释放内存
 
 from PIL import Image
 from diffusers import AutoencoderKLHunyuanVideo
@@ -33,7 +33,8 @@ from diffusers_helper.utils import save_bcthw_as_mp4, crop_or_pad_yield_mask, so
 from diffusers_helper.models.hunyuan_video_packed import HunyuanVideoTransformer3DModelPacked
 from diffusers_helper.pipelines.k_diffusion_hunyuan import sample_hunyuan
 # --- 移除手动内存管理相关的导入 ---
-from diffusers_helper.memory import cpu, gpu
+from diffusers_helper.memory import cpu # 保留 cpu 定义
+# from diffusers_helper.memory import gpu # 我们将重新定义 gpu
 from diffusers_helper.thread_utils import AsyncStream, async_run
 from diffusers_helper.gradio.progress_bar import make_progress_bar_css, make_progress_bar_html
 from transformers import SiglipImageProcessor, SiglipVisionModel
@@ -50,46 +51,72 @@ args = parser.parse_args()
 
 print(args)
 
-# --- 获取计算设备 ---
-if torch.cuda.is_available():
-    gpu = torch.device("cuda:0")
+# --- [修改] 获取计算设备，区分主副 GPU ---
+if torch.cuda.is_available() and torch.cuda.device_count() > 1:
+    gpu0 = torch.device("cuda:0")
+    gpu1 = torch.device("cuda:1")
+    print(f"Using GPU 0: {torch.cuda.get_device_name(gpu0)}")
+    print(f"Using GPU 1: {torch.cuda.get_device_name(gpu1)}")
+    compute_device = gpu0       # 主计算设备 (Transformer, embeddings)
+    secondary_device = gpu1   # 次要设备 (VAE, Image Encoder)
+    torch.cuda.empty_cache() # 清理两个 GPU 的缓存
+    torch.cuda.synchronize(gpu0)
+    torch.cuda.synchronize(gpu1)
+elif torch.cuda.is_available():
+    gpu0 = torch.device("cuda:0")
+    print(f"Using GPU 0: {torch.cuda.get_device_name(gpu0)}")
+    compute_device = gpu0
+    secondary_device = gpu0 #只有一个 GPU 时，都用它
     torch.cuda.empty_cache()
+    torch.cuda.synchronize(gpu0)
 else:
-    gpu = torch.device("cpu")
-print(f"Primary compute device selected: {gpu}")
+    gpu0 = torch.device("cpu")
+    compute_device = gpu0
+    secondary_device = gpu0
+gpu = compute_device # 保留 gpu 变量指向主计算设备，方便后续代码兼容
+# --- [结束 修改] ---
 
 
 # --- 使用 Accelerate 加载支持 device_map 的模型，手动加载不支持的 ---
 print("Loading models...")
 models = {} # 使用字典存储模型
 try:
+    # Accelerate 会处理这些模型的设备放置 (主要放到 compute_device 或 CPU)
+    # 我们可以通过 max_memory 限制 Accelerate 使用的 GPU 内存 (可选)
+    # max_memory = {0: "10GiB", 1: "1GiB", "cpu": "20GiB"} # 示例：限制 GPU1 和 CPU 使用
     print("Loading text_encoder with device_map='auto'...")
     models['text_encoder'] = LlamaModel.from_pretrained(
         "hunyuanvideo-community/HunyuanVideo", subfolder='text_encoder', torch_dtype=torch.float16,
-        device_map="auto", low_cpu_mem_usage=True
+        device_map="auto", low_cpu_mem_usage=True#, max_memory=max_memory
     )
     gc.collect(); torch.cuda.empty_cache()
     print("Loading text_encoder_2 with device_map='auto'...")
     models['text_encoder_2'] = CLIPTextModel.from_pretrained(
         "hunyuanvideo-community/HunyuanVideo", subfolder='text_encoder_2', torch_dtype=torch.float16,
-        device_map="auto", low_cpu_mem_usage=True
+        device_map="auto", low_cpu_mem_usage=True#, max_memory=max_memory
     )
     gc.collect(); torch.cuda.empty_cache()
+
+    # 手动加载 Transformer 到 CPU
     print("Loading Transformer to CPU (device_map not supported)...")
     models['transformer'] = HunyuanVideoTransformer3DModelPacked.from_pretrained(
         'lllyasviel/FramePackI2V_HY', torch_dtype=torch.float16
     ).cpu()
     gc.collect(); torch.cuda.empty_cache()
+
+    # 手动加载 VAE 到 CPU
     print("Loading VAE to CPU (device_map not supported)...")
     models['vae'] = AutoencoderKLHunyuanVideo.from_pretrained(
         "hunyuanvideo-community/HunyuanVideo", subfolder='vae', torch_dtype=torch.float16
     ).cpu()
     gc.collect(); torch.cuda.empty_cache()
+
+    # 尝试用 device_map 加载 Image Encoder，失败则回退到 CPU
     print("Attempting to load image_encoder with device_map='auto'...")
     try:
         models['image_encoder'] = SiglipVisionModel.from_pretrained(
             "lllyasviel/flux_redux_bfl", subfolder='image_encoder', torch_dtype=torch.float16,
-            device_map="auto", low_cpu_mem_usage=True
+            device_map="auto", low_cpu_mem_usage=True#, max_memory=max_memory
         )
         print("Loaded image_encoder with device_map.")
     except ValueError:
@@ -104,6 +131,7 @@ try:
         ).cpu()
     gc.collect(); torch.cuda.empty_cache()
 
+    # 加载 Tokenizer 和 Feature Extractor (放 CPU)
     print("Loading tokenizers and feature extractor...")
     tokenizer = LlamaTokenizerFast.from_pretrained("hunyuanvideo-community/HunyuanVideo", subfolder='tokenizer')
     tokenizer_2 = CLIPTokenizer.from_pretrained("hunyuanvideo-community/HunyuanVideo", subfolder='tokenizer_2')
@@ -152,45 +180,33 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
     video_writer = None
 
     stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'Starting ...'))))
-    compute_device = gpu
+    # compute_device 和 secondary_device 已在全局定义
 
     transformer_on_gpu = False
-    vae_on_gpu = False
-    image_encoder_on_gpu = False
+    vae_on_secondary = False # 改为跟踪是否在 secondary device
+    image_encoder_on_secondary = False # 改为跟踪是否在 secondary device
 
     try:
         # --- 文本编码 ---
         stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'Text encoding ...'))))
         print("Starting text encoding...")
-        # 获取 positive prompt embeddings
+        # encode_prompt_conds 内部会将输入移到 text_encoder/text_encoder_2 所在的设备 (由 Accelerate 管理)
         llama_vec, clip_l_pooler = encode_prompt_conds(prompt, text_encoder, text_encoder_2, tokenizer, tokenizer_2)
-        # 获取 positive attention mask (假设 encode_prompt_conds 内部返回或可以获取)
-        # 注意：这里的 llama_attention_mask 获取方式需要根据 encode_prompt_conds 的实现调整
-        # 作为一个 placeholder，我们先假设它和 llama_vec 维度相关
-        # 正确的方式是修改 encode_prompt_conds 返回 mask 或重新 tokenize 获取
-        llama_attention_mask = torch.ones_like(llama_vec[..., 0], dtype=torch.long, device=cpu) # Placeholder!
-
         # --- [修改] 初始化负向变量 ---
-        llama_vec_n = None
-        clip_l_pooler_n = None
-        llama_attention_mask_n = None
-        # --- [结束 修改] ---
-
+        llama_vec_n = None; clip_l_pooler_n = None; llama_attention_mask_n = None
         if cfg == 1:
             print("CFG=1, using zero negative embeddings.")
-            llama_vec_n = torch.zeros_like(llama_vec)
-            clip_l_pooler_n = torch.zeros_like(clip_l_pooler)
-            llama_attention_mask_n = torch.zeros_like(llama_attention_mask) # 假设零 mask
+            llama_vec_n = torch.zeros_like(llama_vec); clip_l_pooler_n = torch.zeros_like(clip_l_pooler)
+            # 假设 mask 形状与 llama_vec 匹配，创建全0 mask
+            llama_attention_mask = torch.ones_like(llama_vec[..., 0], dtype=torch.long, device=cpu) # Placeholder 正向mask
+            llama_attention_mask_n = torch.zeros_like(llama_attention_mask)
         else:
             print("CFG!=1, encoding negative prompt...")
-            # 获取 negative prompt embeddings
-            # 假设 encode_prompt_conds 只处理一个 prompt，需要调用两次
             llama_vec_n, clip_l_pooler_n = encode_prompt_conds(n_prompt, text_encoder, text_encoder_2, tokenizer, tokenizer_2)
-            # 假设负向 mask 获取方式类似
-            llama_attention_mask_n = torch.ones_like(llama_vec_n[..., 0], dtype=torch.long, device=cpu) # Placeholder!
-
+            # 假设 mask 获取方式
+            llama_attention_mask = torch.ones_like(llama_vec[..., 0], dtype=torch.long, device=cpu) # Placeholder 正向mask
+            llama_attention_mask_n = torch.ones_like(llama_vec_n[..., 0], dtype=torch.long, device=cpu) # Placeholder 负向mask
         print("Text encoding finished.")
-
 
         # --- 处理输入图像 ---
         stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'Image processing ...'))))
@@ -203,37 +219,53 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
 
         # --- VAE 编码 ---
         stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'VAE encoding ...'))))
-        print("Moving VAE to GPU for encoding...")
-        vae.to(gpu); vae_on_gpu = True
+        # --- [修改] 手动加载 VAE 到 secondary_device ---
+        print(f"Moving VAE to {secondary_device} for encoding...")
+        vae.to(secondary_device); vae_on_secondary = True
         gc.collect(); torch.cuda.empty_cache()
-        print("VAE moved to GPU.")
+        print(f"VAE moved to {secondary_device}.")
+        # --- 结束 ---
         print("Starting VAE encoding...")
         start_latent = vae_encode(input_image_pt.to(device=vae.device, dtype=vae.dtype), vae)
         print(f"VAE encoding finished...")
+        # --- VAE 编码后移回 CPU ---
         print("Moving VAE back to CPU...")
-        vae.to(cpu); vae_on_gpu = False
+        vae.to(cpu); vae_on_secondary = False
         gc.collect(); torch.cuda.empty_cache()
         print("VAE moved to CPU.")
-        start_latent = start_latent.to(compute_device) # 移动 latent 到主计算设备
+        # --- 结束 ---
+        # 将 latent 移到主计算设备 compute_device
+        start_latent = start_latent.to(compute_device)
         print(f"Start latent moved to {compute_device}")
 
 
         # --- CLIP Vision 编码 ---
         stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'CLIP Vision encoding ...'))))
-        if hasattr(image_encoder, 'device') and image_encoder.device == torch.device('cpu'):
-            print("Moving Image Encoder to GPU for encoding...")
-            image_encoder.to(gpu); image_encoder_on_gpu = True
+        # --- [修改] 如果 image_encoder 在 CPU，移到 secondary_device ---
+        moved_image_encoder_to_secondary = False
+        # image_encoder 可能由 Accelerate 管理在某个 GPU 上，也可能加载失败在 CPU
+        if hasattr(image_encoder, 'hf_device_map'): # 如果由 Accelerate 管理
+             print("Image encoder managed by Accelerate.")
+        elif hasattr(image_encoder, 'device') and image_encoder.device == torch.device('cpu'): # 如果在 CPU
+            print(f"Moving Image Encoder to {secondary_device} for encoding...")
+            image_encoder.to(secondary_device); image_encoder_on_secondary = True
+            moved_image_encoder_to_secondary = True # 标记我们移动了它
             gc.collect(); torch.cuda.empty_cache()
-            print("Image Encoder moved to GPU.")
+            print(f"Image Encoder moved to {secondary_device}.")
+        # --- 结束 ---
         print("Starting CLIP Vision encoding...")
+        # hf_clip_vision_encode 需要输入 NumPy，模型可能在 CPU 或 GPU
         image_encoder_output = hf_clip_vision_encode(input_image_np, feature_extractor, image_encoder)
         image_encoder_last_hidden_state = image_encoder_output.last_hidden_state
         print(f"CLIP Vision encoding finished...")
-        if image_encoder_on_gpu:
+        # --- [修改] 编码后移回 CPU (如果之前手动移动了) ---
+        if moved_image_encoder_to_secondary:
              print("Moving Image Encoder back to CPU...")
-             image_encoder.to(cpu); image_encoder_on_gpu = False
+             image_encoder.to(cpu); image_encoder_on_secondary = False
              gc.collect(); torch.cuda.empty_cache()
              print("Image Encoder moved to CPU.")
+        # --- 结束 ---
+        # 将 hidden_state 移到主计算设备
         image_encoder_last_hidden_state = image_encoder_last_hidden_state.to(compute_device)
         print(f"Image encoder hidden state moved to {compute_device}")
 
@@ -241,19 +273,18 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
         # --- Dtype 转换 ---
         print("Converting dtypes and moving tensors...")
         start_latent = start_latent.to(torch.float16)
+        # 确保所有 embedding/pooler 在 compute_device 上且类型正确
         llama_vec = llama_vec.to(compute_device, dtype=torch.float16)
-        clip_l_pooler = clip_l_pooler.to(compute_device, dtype=torch.float16)
-        # --- [修改] 现在 llama_vec_n 和 clip_l_pooler_n 肯定有值 (来自 if/else) ---
         llama_vec_n = llama_vec_n.to(compute_device, dtype=torch.float16)
+        clip_l_pooler = clip_l_pooler.to(compute_device, dtype=torch.float16)
         clip_l_pooler_n = clip_l_pooler_n.to(compute_device, dtype=torch.float16)
-        # --- [结束 修改] ---
         image_encoder_last_hidden_state = image_encoder_last_hidden_state.to(compute_device, dtype=torch.float16)
         print("Embeddings and poolers moved and converted to float16 on compute device.")
 
 
-        # --- 将 Transformer 移到 GPU (在采样循环开始前) ---
-        print("Moving Transformer to GPU for sampling...")
-        transformer.to(gpu); transformer_on_gpu = True
+        # --- 将 Transformer 移到 GPU (主计算设备) ---
+        print(f"Moving Transformer to {compute_device} for sampling...")
+        transformer.to(compute_device); transformer_on_gpu = True
         gc.collect(); torch.cuda.empty_cache()
         print("Transformer moved to GPU.")
         # --- 结束 ---
@@ -307,13 +338,17 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
             def callback(d):
                 try:
                     preview = d['denoised']
-                    preview_vae_device = gpu
+                    # --- [修改] VAE 需要移到 secondary_device ---
+                    preview_vae_device = secondary_device # 目标是副 GPU
                     moved_vae_for_preview = False
                     if hasattr(vae, 'device') and vae.device == torch.device('cpu'):
                         vae.to(preview_vae_device); moved_vae_for_preview = True
-                    preview = vae_decode_fake(preview.to(preview_vae_device))
+                    # --- 结束 ---
+                    preview = vae_decode_fake(preview.to(preview_vae_device)) # 移到 VAE 设备再解码
+                    # --- 如果移动了 VAE，移回 CPU ---
                     if moved_vae_for_preview:
                         vae.to(cpu)
+                    # --- 结束 ---
                     preview = (preview * 127.5 + 127.5).clamp(0, 255).byte()
                     preview = preview.cpu().numpy()
                     t_idx = preview.shape[2] // 2
@@ -339,18 +374,18 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
             # --- [修改] 确保 attention masks 也被正确处理和移动 ---
             current_llama_mask = llama_attention_mask.to(compute_device) if llama_attention_mask is not None else None
             current_llama_mask_n = llama_attention_mask_n.to(compute_device) if llama_attention_mask_n is not None else None
-            if current_llama_mask is None: # 如果 positive mask 获取失败，创建全1 mask
+            if current_llama_mask is None:
                  print("Warning: Positive Llama attention mask is None, creating default.")
                  current_llama_mask = torch.ones_like(llama_vec[..., 0], dtype=torch.long, device=compute_device)
-            if current_llama_mask_n is None and cfg != 1: # 如果 negative mask 获取失败 (且 cfg != 1)，创建全1 mask
+            if current_llama_mask_n is None and cfg != 1:
                  print("Warning: Negative Llama attention mask is None, creating default.")
                  current_llama_mask_n = torch.ones_like(llama_vec_n[..., 0], dtype=torch.long, device=compute_device)
-            elif cfg == 1 and current_llama_mask_n is None: # 如果 cfg=1 且 mask 为 None，创建全0 mask
-                 current_llama_mask_n = torch.zeros_like(current_llama_mask) # 使用 positive mask 形状创建全0
+            elif cfg == 1 and current_llama_mask_n is None:
+                 current_llama_mask_n = torch.zeros_like(current_llama_mask)
             # --- [结束 修改] ---
 
             generated_latents = sample_hunyuan(
-                transformer=transformer,
+                transformer=transformer, # 已经在 compute_device (gpu0)
                 sampler='unipc',
                 width=width,
                 height=height,
@@ -361,10 +396,10 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
                 num_inference_steps=steps,
                 generator=rnd,
                 prompt_embeds=llama_vec.to(compute_device),
-                prompt_embeds_mask=current_llama_mask, # 使用处理后的 mask
+                prompt_embeds_mask=current_llama_mask,
                 prompt_poolers=clip_l_pooler.to(compute_device),
                 negative_prompt_embeds=llama_vec_n.to(compute_device),
-                negative_prompt_embeds_mask=current_llama_mask_n, # 使用处理后的 mask
+                negative_prompt_embeds_mask=current_llama_mask_n,
                 negative_prompt_poolers=clip_l_pooler_n.to(compute_device),
                 device=compute_device,
                 dtype=torch.float16,
@@ -379,7 +414,7 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
                 callback=callback,
             )
             print("Sampling finished for this section.")
-            # generated_latents 在 compute_device (gpu) 上
+            # generated_latents 在 compute_device (gpu0) 上
 
             # --- 处理采样结果 ---
             if is_last_section:
@@ -389,15 +424,15 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
             total_generated_latent_frames += added_latent_frames_count
 
             # --- 更新 history_latents ---
-            history_latents = torch.cat([generated_latents.to(device=history_latents.device, dtype=history_latents.dtype), history_latents], dim=2)
+            history_latents = torch.cat([generated_latents.to(device=history_latents.device, dtype=history_latents.dtype), history_latents], dim=2) # 移到 CPU
 
             # --- VAE 解码和流式写入 ---
             if added_latent_frames_count > 0:
-                # --- 手动加载 VAE 到 GPU ---
-                print("Moving VAE to GPU for decoding...")
-                vae.to(gpu); vae_on_gpu = True
+                # --- [修改] 手动加载 VAE 到 secondary_device ---
+                print(f"Moving VAE to {secondary_device} for decoding...")
+                vae.to(secondary_device); vae_on_secondary = True
                 gc.collect(); torch.cuda.empty_cache()
-                print("VAE moved to GPU.")
+                print(f"VAE moved to {secondary_device}.")
                 # --- 结束 ---
 
                 latents_to_decode_this_iter = history_latents[:, :, :added_latent_frames_count, :, :] # 从 history 切片 (在 CPU)
@@ -406,7 +441,7 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
 
                 # --- 解码后移回 CPU ---
                 print("Moving VAE back to CPU...")
-                vae.to(cpu); vae_on_gpu = False
+                vae.to(cpu); vae_on_secondary = False
                 gc.collect(); torch.cuda.empty_cache()
                 print("VAE moved to CPU.")
                 # --- 结束 ---
@@ -466,25 +501,25 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
             video_writer = None
 
         # --- 将模型移回 CPU ---
-        if transformer_on_gpu:
+        if transformer_on_gpu: # 注意变量名是 transformer_on_gpu
             try:
                 print("Moving Transformer back to CPU in finally...")
                 transformer.to(cpu)
-                transformer_on_gpu = False
+                transformer_on_gpu = False # 修正变量名
             except Exception as e_trans_unload:
                 print(f"Error moving Transformer to CPU in finally: {e_trans_unload}")
-        if vae_on_gpu:
+        if vae_on_secondary: # 注意变量名是 vae_on_secondary
              try:
                  print("Moving VAE back to CPU in finally...")
                  vae.to(cpu)
-                 vae_on_gpu = False
+                 vae_on_secondary = False # 修正变量名
              except Exception as e_vae_unload:
                   print(f"Error moving VAE to CPU in finally: {e_vae_unload}")
-        if image_encoder_on_gpu:
+        if image_encoder_on_secondary: # 注意变量名是 image_encoder_on_secondary
              try:
                  print("Moving Image Encoder back to CPU in finally...")
                  image_encoder.to(cpu)
-                 image_encoder_on_gpu = False
+                 image_encoder_on_secondary = False # 修正变量名
              except Exception as e_img_unload:
                   print(f"Error moving Image Encoder to CPU in finally: {e_img_unload}")
 
@@ -492,7 +527,6 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
         try:
             print("Releasing models potentially managed by Accelerate...")
             release_memory(models.get('text_encoder'), models.get('text_encoder_2'))
-            # 不再尝试 del 全局 models 字典中的项
             print("Attempting final garbage collection and cache clearing...")
             gc.collect()
             torch.cuda.empty_cache()
