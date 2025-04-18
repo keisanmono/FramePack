@@ -147,22 +147,32 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
         # --- 文本编码 ---
         stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'Text encoding ...'))))
         if not high_vram:
-            # --- [修改] 显式加载两个文本编码器到 GPU ---
-            print("Low VRAM: Loading text encoders to GPU for encoding...")
-            load_model_as_complete(text_encoder, target_device=gpu)   # <--- 显式加载 Llama
-            load_model_as_complete(text_encoder_2, target_device=gpu) # <--- 显式加载 CLIP
-            print("Text encoders loaded to GPU.")
+            # --- [修改] 只加载 text_encoder_2，并手动移动 text_encoder 的 embedding 层 ---
+            print("Low VRAM: Loading text_encoder_2 to GPU...")
+            load_model_as_complete(text_encoder_2, target_device=gpu) # <--- 加载 CLIP
+            print("Low VRAM: Moving text_encoder's embedding layer to GPU...")
+            try:
+                text_encoder.embed_tokens.to(gpu) # <--- 只移动 Embedding 层到 GPU
+                gc.collect() # 清理一下内存
+                print("Text encoder embedding moved to GPU.")
+            except Exception as e_embed:
+                 print(f"Warning: Failed to move text_encoder embedding to GPU: {e_embed}") # 加个警告以防万一
             # --- [结束 修改] ---
 
-        # 调用编码函数 (hunyuan.py 中的代码不用改，它内部会将 input_ids 移到 model.device)
+        # 调用编码函数 (hunyuan.py 中的代码会将 input_ids 移到 model.device)
         llama_vec, clip_l_pooler = encode_prompt_conds(prompt, text_encoder, text_encoder_2, tokenizer, tokenizer_2)
 
-        # --- [可选但推荐] 编码后立即卸载文本编码器以节省 VRAM ---
+        # --- [修改] 编码后，将 Embedding 层移回 CPU 并卸载 text_encoder_2 ---
         if not high_vram:
-            print("Low VRAM: Unloading text encoders from GPU after encoding...")
-            unload_complete_models(text_encoder) # <--- 卸载 Llama
-            unload_complete_models(text_encoder_2) # <--- 卸载 CLIP
-        # --- [结束 可选] ---
+            print("Low VRAM: Moving text_encoder's embedding layer back to CPU...")
+            try:
+                text_encoder.embed_tokens.to(cpu) # <--- 移回 CPU，释放 VRAM
+                gc.collect()
+                print("Low VRAM: Unloading text_encoder_2 from GPU...")
+                unload_complete_models(text_encoder_2) # <--- 卸载 CLIP
+            except Exception as e_unload:
+                print(f"Warning: Error during post-encoding cleanup: {e_unload}")
+        # --- [结束 修改] ---
 
         # --- 处理输入图像 ---
         stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'Image processing ...'))))
@@ -226,7 +236,6 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
             indices = torch.arange(0, sum([1, latent_padding_size, latent_window_size, 1, 2, 16])).unsqueeze(0)
             clean_latent_indices_pre, blank_indices, latent_indices, clean_latent_indices_post, clean_latent_2x_indices, clean_latent_4x_indices = indices.split([1, latent_padding_size, latent_window_size, 1, 2, 16], dim=1)
             clean_latent_indices = torch.cat([clean_latent_indices_pre, clean_latent_indices_post], dim=1)
-            # --- [修正] 使用关键字参数调用 .to() ---
             clean_latents_pre = start_latent.to(device=history_latents.device, dtype=history_latents.dtype) # 将 start_latent 转到 history (cpu, float16)
             clean_latents_post, clean_latents_2x, clean_latents_4x = history_latents[:, :, :1 + 2 + 16, :, :].split([1, 2, 16], dim=2)
             clean_latents = torch.cat([clean_latents_pre, clean_latents_post], dim=2)
@@ -301,14 +310,12 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
 
             # --- 处理采样结果 ---
             if is_last_section: # 如果是最后一段，将起始 latent 拼接到开头
-                # --- [修正] 使用关键字参数调用 .to() ---
                 generated_latents = torch.cat([start_latent.to(device=generated_latents.device, dtype=generated_latents.dtype), generated_latents], dim=2)
 
             added_latent_frames_count = int(generated_latents.shape[2]) # 获取本次生成的 latent 帧数
             total_generated_latent_frames += added_latent_frames_count # 更新总帧数
 
             # --- 更新 history_latents ---
-            # --- [修正] 使用关键字参数调用 .to() ---
             # 将新生成的 latent (在 GPU, float16) 移到 history_latents (在 CPU, float16) 并拼接
             history_latents = torch.cat([generated_latents.to(device=history_latents.device, dtype=history_latents.dtype), history_latents], dim=2)
 
@@ -319,13 +326,10 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
                     load_model_as_complete(vae, target_device=gpu) # 加载 VAE
 
                 # --- 只解码本次循环新生成的 latent 部分 ---
-                # 使用刚生成的 generated_latents，它已经在正确的设备和类型上 (需要确认！)
-                # 或者从 history_latents 切片，然后移到 VAE 设备
-                # 采用切片方式更安全，因为 generated_latents 可能已被修改
-                latents_to_decode_this_iter = history_latents[:, :, :added_latent_frames_count, :, :].cpu() # 从 history 切片并移到 CPU
+                # 从 history_latents 切片出当前迭代需要解码的部分
+                latents_to_decode_this_iter = history_latents[:, :, :added_latent_frames_count, :, :].cpu()
 
-                # --- [修正] 使用关键字参数调用 .to() ---
-                # 确保传递给 vae_decode 的 latent 在 VAE 设备上且类型正确
+                # --- 确保传递给 vae_decode 的 latent 在 VAE 设备上且类型正确 ---
                 current_pixels_segment = vae_decode(latents_to_decode_this_iter.to(device=vae.device, dtype=vae.dtype), vae).float().cpu() # 解码到 float32 CPU
 
                 # --- 转换为 NumPy uint8 格式 [T, H, W, C] for imageio ---
@@ -337,8 +341,7 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
                 # --- 初始化视频写入器 (如果需要) ---
                 if video_writer is None:
                     fps_to_save = 30
-                    # 设置 output_buffersize 增加写入缓冲，可能提高效率
-                    video_writer = imageio.get_writer(output_filename, fps=fps_to_save, codec='libx264', quality=8, output_params=['-preset', 'fast', '-tune', 'fastdecode'], macro_block_size=16, ffmpeg_log_level='warning') # 更详细的 ffmpeg 参数
+                    video_writer = imageio.get_writer(output_filename, fps=fps_to_save, codec='libx264', quality=8, output_params=['-preset', 'fast', '-tune', 'fastdecode'], macro_block_size=16, ffmpeg_log_level='warning')
                     print(f"Video writer initialized for {output_filename}")
 
                 # --- 将当前段的帧写入视频文件 ---
